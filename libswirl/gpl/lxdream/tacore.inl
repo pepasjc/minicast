@@ -406,13 +406,18 @@ static void ta_init_list( unsigned int listtype ) {
 
     ta_status.current_tile_matrix = tile_matrix;
 
-    /* If the list grows down, the end must be < tile matrix start. 
-     * If it grows up, the end must be > tile matrix start.
-     * Don't ask me why, it just does...
-     */
-    if( ((ta_status.tilelist_dir == TA_GROW_DOWN && list_end <= tile_matrix) ||
-            (ta_status.tilelist_dir == TA_GROW_UP && list_end >= tile_matrix )) &&
-            listtype <= TA_LIST_PUNCH_OUT ) {
+    // /* If the list grows down, the end must be < tile matrix start. 
+    //  * If it grows up, the end must be > tile matrix start.
+    //  * Don't ask me why, it just does...
+    //  */
+    // if( ((ta_status.tilelist_dir == TA_GROW_DOWN && list_end <= tile_matrix) ||
+    //         (ta_status.tilelist_dir == TA_GROW_UP && list_end >= tile_matrix )) &&
+    //         listtype <= TA_LIST_PUNCH_OUT )
+    // I don't think the hardware enforces this, it coud just have no "end" in practice.
+    // Guilty Gear sets it up incorrectly and it seems to work on real hw
+    // This needs further testing ~skmp
+
+    {
         int i;
         for( i=0; i < listtype; i++ ) {
             int size = tilematrix_sizes[(config & 0x03)] << 2;
@@ -434,13 +439,15 @@ static void ta_init_list( unsigned int listtype ) {
                 p += ta_status.current_tile_size * 4;
             }
         }
-    } else {
-        ta_status.current_tile_size = 0;
     }
-
-    if( tile_matrix == list_end ) {
-        ta_status.current_tile_size = 0;
-    }
+    // See commend above
+    // else {
+    //     ta_status.current_tile_size = 0;
+    // }
+    // 
+    // if( tile_matrix == list_end ) {
+    //     ta_status.current_tile_size = 0;
+    // }
 
     ta_status.state = STATE_IN_LIST;
     ta_status.current_list_type = listtype;
@@ -1009,8 +1016,13 @@ static void ta_parse_sprite_context( union ta_data *data ) {
     if( data[0].i & TA_POLYCMD_TEXTURED ) {
         ta_status.poly_vertex_size = 2;
         ta_status.poly_vertex[2].detail[1] = data[4].i;
+        if( TA_POLYCMD_IS_SPECULAR(data[0].i) ) {
+            ta_status.poly_vertex_size = 3;
+            ta_status.poly_vertex[2].detail[2] = data[5].i;   /* offset colour */
+        }
         ta_status.current_vertex_type = TA_VERTEX_TEX_SPRITE;
     } else {
+        /* untextured: TA_POLYCMD_IS_SPECULAR requires the textured bit, so no offset */
         ta_status.poly_vertex_size = 1;
         ta_status.poly_vertex[2].detail[0] = data[4].i;
         ta_status.current_vertex_type = TA_VERTEX_SPRITE;
@@ -1244,6 +1256,12 @@ static void ta_parse_vertex_block2( union ta_data *data ) {
         ta_status.poly_vertex[1].detail[0] = data[6].i;
         ta_status.poly_vertex[1].detail[1] = 0;
         ta_status.poly_vertex[2].detail[0] = data[7].i;
+        /* offset-colour slot: flat like the base colour - only v2 carries it (set from
+         * the context), the rest are zero. Harmless when poly_vertex_size is 2, since
+         * only 3+poly_vertex_size words per vertex are emitted. */
+        ta_status.poly_vertex[0].detail[2] = 0;
+        ta_status.poly_vertex[1].detail[2] = 0;
+        vertex->detail[2] = 0;
         break;
     case TA_VERTEX_MOD_VOLUME:
     case TA_VERTEX_LISTLESS:
