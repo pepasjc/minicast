@@ -266,7 +266,7 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 		verify(rbi->code!=0);
 
 		// perf samples the rx mapping, rbi->code is rw
-		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr);
+		perf_map_AddBlock((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi->addr, rbi->sh4_code_size);
 		perf_map_AddShops((void*)CC_RW2RX(rbi->code), rbi->host_code_size, rbi);
 
 		bool doLock = !bm_RamPageHasData(rbi->addr, rbi->sh4_code_size); // && maybe some setting?

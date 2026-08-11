@@ -21,8 +21,16 @@
 	Instead, tools/symbolize_perf.py joins `perf script` text output against this
 	map, which avoids perf's symbolization path entirely.
 
-	Set MINICAST_PERF_MAP to enable. An absolute path is used as-is, anything else
-	falls back to /tmp/perf-<pid>.map.
+	Block symbols are "sh4_<guest-pc>+<guest-bytes>". The guest span matters
+	because a block's cost belongs to every SH4 instruction it covers, not just
+	its entry pc -- tools/perfheat.py uses it to spread a sample across the
+	address range the block actually executes.
+
+	Set MINICAST_PERF_MAP to the file to write; the value is used verbatim
+	(relative paths included) so the map lands where you can find it. There is no
+	pid-named fallback - captures are normally symbolized on a different machine,
+	where /tmp/perf-<pid>.map is both hard to locate and easy to mix up between
+	runs. MINICAST_SHOP_MAP works the same way.
 
 	Usage:
 		MINICAST_PERF_MAP=/tmp/jit.map ./minicast.elf ...
@@ -53,6 +61,6 @@
 struct RuntimeBlockInfo;
 
 void perf_map_Init();
-void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr);
+void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr, u32 guest_size);
 void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block);
 void perf_map_Term();

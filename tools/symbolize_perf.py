@@ -204,6 +204,12 @@ def main():
             continue
 
         jit += 1
+        # Block symbols carry their guest span as "sh4_<pc>+<bytes>" (perfheat.py
+        # needs it). Costs are still totalled per entry pc here, so drop the span
+        # rather than splitting one block across rows when a recompile changes its
+        # length. Shop names never contain '+'.
+        if name.startswith("sh4_"):
+            name = name.split("+", 1)[0]
         counts[name] += 1
 
     if not total:

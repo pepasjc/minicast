@@ -24,12 +24,9 @@ void perf_map_Init()
 
 		if (shop_path != NULL)
 		{
+			// used verbatim - see the note on MINICAST_PERF_MAP below
 			char shop_name[256];
-
-			if (shop_path[0] == '/')
-				sprintf(shop_name, "%.250s", shop_path);
-			else
-				sprintf(shop_name, "/tmp/shop-%d.map", getpid());
+			sprintf(shop_name, "%.250s", shop_path);
 
 			shop_map_file = fopen(shop_name, "w");
 
@@ -48,14 +45,13 @@ void perf_map_Init()
 	if (path == NULL)
 		return;
 
-	// an explicit path is easier to find afterwards than something relative to
-	// whatever directory the emulator happened to be launched from
+	// Used VERBATIM, relative paths included. There is deliberately no
+	// /tmp/perf-<pid>.map fallback: the map is usually carried off the MiSTer and
+	// joined against the capture on another machine, where a pid-named file in
+	// /tmp is both hard to find and easy to confuse with another run's. Whatever
+	// path is asked for is the path written.
 	char name[256];
-
-	if (path[0] == '/')
-		sprintf(name, "%.250s", path);
-	else
-		sprintf(name, "/tmp/perf-%d.map", getpid());
+	sprintf(name, "%.250s", path);
 
 	perf_map_file = fopen(name, "w");
 
@@ -65,7 +61,7 @@ void perf_map_Init()
 		printf("perf_map: failed to open %s\n", name);
 }
 
-void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr)
+void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr, u32 guest_size)
 {
 	if (!perf_map_file)
 		return;
@@ -75,7 +71,15 @@ void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr)
 	// These are runtime addresses. perf script reports samples as offsets within
 	// minicast.elf, so symbolize_perf.py rebases them before matching -- see the
 	// comments there.
-	fprintf(perf_map_file, "%lx %x sh4_%08X\n", (unsigned long)code, host_code_size, guest_addr);
+	//
+	// The symbol carries the guest span as "+<bytes>", not just the entry pc: a
+	// block covers sh4_code_size bytes of SH4 code and its cost belongs to that
+	// whole range, which is what tools/perfheat.py needs to place a sample on an
+	// address axis. Keeping it inside the symbol name leaves the file valid
+	// perf-map format (start / size / free-form name), so nothing that already
+	// reads it has to care.
+	fprintf(perf_map_file, "%lx %x sh4_%08X+%X\n",
+		(unsigned long)code, host_code_size, guest_addr, guest_size);
 
 	// blocks compile for the life of the process, so a crash or kill -9 must not
 	// lose the entries written so far
@@ -178,7 +182,7 @@ void perf_map_Term()
 #else
 
 void perf_map_Init() { }
-void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr) { }
+void perf_map_AddBlock(void* code, u32 host_code_size, u32 guest_addr, u32 guest_size) { }
 void perf_map_AddShops(void* code, u32 host_code_size, RuntimeBlockInfo* block) { }
 void perf_map_Term() { }
 
