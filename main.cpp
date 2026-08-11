@@ -49,7 +49,7 @@ void do_vram_dump(u8* vram, u8* pvr_regs) {
 			return;
 		}
 		fclose(f);
-		printf("Frame dumped -> vram_%d.bin/pvr_regs_%d.bin\n", vram_dump_number);
+		printf("Frame dumped -> vram_%d.bin/pvr_regs_%d.bin\n", vram_dump_number, vram_dump_number);
 		vram_dump_number++;
 	}
 }
