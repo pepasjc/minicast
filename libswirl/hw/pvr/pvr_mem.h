@@ -18,7 +18,6 @@ u32* vrp(u8* vram, u32 addr);
 //vram 32-64b
 
 
-extern bool fb_dirty;
 
 void pvr_update_framebuffer_watches();
 

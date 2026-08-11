@@ -196,7 +196,6 @@ extern bool pend_rend;
 //u32 fb1_watch_addr_end;
 //u32 fb2_watch_addr_start;
 //u32 fb2_watch_addr_end;
-//bool fb_dirty;
 
 
 //maybe

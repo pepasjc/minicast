@@ -33,21 +33,6 @@ static SystemBus* sb;
 
 //vram 32-64b
 
-u32 fb1_watch_addr_start;
-u32 fb1_watch_addr_end;
-u32 fb2_watch_addr_start;
-u32 fb2_watch_addr_end;
-bool fb_dirty;
-
-void pvr_update_framebuffer_watches()
-{
-    u32 fb_size = (FB_R_SIZE.fb_y_size + 1) * (FB_R_SIZE.fb_x_size + FB_R_SIZE.fb_modulus) * 4;
-    fb1_watch_addr_start = FB_R_SOF1 & VRAM_MASK;
-    fb1_watch_addr_end = fb1_watch_addr_start + fb_size;
-    fb2_watch_addr_start = FB_R_SOF2 & VRAM_MASK;
-    fb2_watch_addr_end = fb2_watch_addr_start + fb_size;
-}
-
 
 //read
 u8 DYNACALL pvr_read_area1_8(void* sh4, u32 addr)
@@ -79,12 +64,6 @@ void DYNACALL pvr_write_area1_16(void* ctx, u32 addr,u16 data)
 	auto vram = reinterpret_cast<u8*>(ctx);
 
     u32 vaddr = addr & VRAM_MASK;
-    if (!fb_dirty
-        && ((vaddr >= fb1_watch_addr_start && vaddr < fb1_watch_addr_end)
-            || (vaddr >= fb2_watch_addr_start && vaddr < fb2_watch_addr_end)))
-    {
-        fb_dirty = true;
-    }
 	*(u16*)&vram[pvr_map32(addr)]=data;
 }
 void DYNACALL pvr_write_area1_32(void* ctx, u32 addr,u32 data)
@@ -92,12 +71,7 @@ void DYNACALL pvr_write_area1_32(void* ctx, u32 addr,u32 data)
 	auto vram = reinterpret_cast<u8*>(ctx);
 
     u32 vaddr = addr & VRAM_MASK;
-    if (!fb_dirty
-        && ((vaddr >= fb1_watch_addr_start && vaddr < fb1_watch_addr_end)
-            || (vaddr >= fb2_watch_addr_start && vaddr < fb2_watch_addr_end)))
-    {
-        fb_dirty = true;
-    }
+
 	*(u32*)&vram[pvr_map32(addr)] = data;
 }
 
