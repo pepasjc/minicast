@@ -2109,14 +2109,13 @@ struct Arm32NGenBackend: NGenBackend
 			switch(block->BlockType)
 			{
 			case BET_StaticJump:
-			case BET_StaticCall:
 			case BET_Cond_0:
 			case BET_Cond_1:	//NextBlock is always forward
 				cycle_check = block->BranchBlock<=block->addr;
 				break;
 
 			default:
-				cycle_check = false;	//dynamic ends: skip the poll
+				cycle_check = true;	//dynamic ends/ calls: always do the calls
 				break;
 			}
 		}
