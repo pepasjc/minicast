@@ -31,8 +31,8 @@ void UpdateStatsOSD();
  * replica of the polly2 SPG scanout (game window from FB_R_SOF1 +
  * FB_R_CTRL/VO_CONTROL, plus the border bands RE-RENDERED locally: top =
  * the stats OSD, bottom = black for now) at SOURCE resolution: a 640x540
- * BMP (30 band + 480 game + 30 band) written to
- * /media/fat/games/Dreamcast/<datetime>.bmp. */
+ * PNG (30 band + 480 game + 30 band) written to
+ * /media/fat/screenshot/Dreamcast/<datetime>.png. */
 void QueueScreenshot();
 /* vram = the emu's FPGA-shared VRAM mapping (rend_init_renderer's pointer);
  * the game framebuffer is read through it, only the band pages get their

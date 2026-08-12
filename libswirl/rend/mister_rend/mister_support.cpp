@@ -35,6 +35,11 @@
 #include "../../hw/pvr/pvr_regs.h"
 #include "../../../../polly2-rtl/driver/polly2_mmio.h"
 
+/* PNG screenshot writer (public domain, header-only - this TU carries the
+ * single implementation) */
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../../deps/stb/stb_image_write.h"
+
 /* Physical DDR home of the band FB: the first 128-byte-aligned byte after
  * the 16MB VRAM window at 0x32000000 (HW_FPGA_VRAM_OFST + SPAN in
  * _vmem.cpp) - outside everything the core or Linux touches. */
@@ -245,9 +250,10 @@ void ReportRendererStats(double wait_ms, u32 cycles)
 //   * bottom band (lines 510..539): black for now (its renderer lands soon).
 // The line stride mirrors sys_top's fb_disp_stride (640 px x 2/2/3/4 bytes
 // by depth, halved by pixel_double) - NOT FB_R_SIZE.
-// Output: 24bpp BMP at /media/fat/screenshot/Dreamcast/<datetime>.bmp.
+// Output: 24bpp RGB PNG (stb_image_write) at
+// /media/fat/screenshot/Dreamcast/<datetime>.png.
 
-#define SHOT_DIR       "/media/fat/screenshot/Dreamcast"
+#define SHOT_DIR       "/media/fat/screenshots/Dreamcast"
 #define SHOT_W         640
 #define SHOT_H         540
 #define SHOT_Y0        30            /* game window y 30..509 */
@@ -374,7 +380,7 @@ static void spg_screenshot(const u8* vram)
 		memcpy(frame + (size_t)oy * SHOT_W * 3, strip, sizeof strip);
 	}
 
-	/* ---- write the BMP (24bpp BGR, bottom-up; 1920*3 is 4-aligned) ---- */
+	/* ---- write the PNG (24bpp RGB, top-down - stb takes `frame` as is) ---- */
 	{	/* mkdir -p SHOT_DIR; existing components (the usual case) are fine */
 		char dir[] = SHOT_DIR;
 		for (char* p = dir + 1; ; p++) {
@@ -392,38 +398,14 @@ static void spg_screenshot(const u8* vram)
 	struct tm tmv;
 	localtime_r(&t, &tmv);
 	char path[128];
-	snprintf(path, sizeof path, SHOT_DIR "/%04d-%02d-%02d_%02d-%02d-%02d.bmp",
+	snprintf(path, sizeof path, SHOT_DIR "/%04d-%02d-%02d_%02d-%02d-%02d.png",
 	         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
 	         tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
-	FILE* f = fopen(path, "wb");
-	if (f) {
-		u32 img = (u32)SHOT_W * SHOT_H * 3, fsz = 54 + img;
-		u8 hdr[54] = { 'B','M' };
-		memcpy(hdr +  2, &fsz, 4);
-		hdr[10] = 54;                                  /* pixel data offset */
-		hdr[14] = 40;                                  /* BITMAPINFOHEADER  */
-		u32 w = SHOT_W, h = SHOT_H;
-		memcpy(hdr + 18, &w, 4);
-		memcpy(hdr + 22, &h, 4);
-		hdr[26] = 1; hdr[28] = 24;                     /* planes, bpp */
-		memcpy(hdr + 34, &img, 4);
-		fwrite(hdr, 1, sizeof hdr, f);
-		for (int y = SHOT_H - 1; y >= 0; y--) {        /* bottom-up, RGB->BGR */
-			u8 row[SHOT_W * 3];
-			const u8* s = frame + (size_t)y * SHOT_W * 3;
-			for (u32 x = 0; x < SHOT_W; x++) {
-				row[x * 3 + 0] = s[x * 3 + 2];
-				row[x * 3 + 1] = s[x * 3 + 1];
-				row[x * 3 + 2] = s[x * 3 + 0];
-			}
-			fwrite(row, 1, sizeof row, f);
-		}
-		fclose(f);
+	if (stbi_write_png(path, SHOT_W, SHOT_H, 3, frame, SHOT_W * 3))
 		printf("mister_support: screenshot -> %s\n", path);
-	} else {
+	else
 		printf("mister_support: cannot write %s\n", path);
-	}
 	free(frame);
 }
 
