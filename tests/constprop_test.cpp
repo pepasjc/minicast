@@ -1200,6 +1200,83 @@ static void t_readm_pair_fusion()
 	verify(count_op(b6.oplist, shop_readm) == 2);
 }
 
+// writes 4 bytes at a time through `base`, then prefs it -- the store queue shape
+static void mk_sq_writes(RuntimeBlockInfo* b, Sh4RegType base, int n)
+{
+	for (int i = 0; i < n; i++)
+		b->oplist.push_back(OP(shop_writem, P(), R(base), R(reg_r1), 4));
+}
+
+static int sq_marked_writes(const RuntimeBlockInfo& b)
+{
+	int n = 0;
+	for (auto& o : b.oplist)
+		if (o.op == shop_writem && o.flags2 == 0x1337)
+			n++;
+	return n;
+}
+
+static void t_sq_pref()
+{
+	// the store queue shape: 32 bytes through r4, then pref @r4. (The scan
+	// stops before op 0, so the block starts with the address setup anyway.)
+	mock_reset();
+	RuntimeBlockInfo b = mkblk();
+	b.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b, reg_r4, 8);
+	b.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b);
+	verify(b.oplist.back().flags == 0x1337);
+	verify(sq_marked_writes(b) == 8);
+
+	// the same, but something loads through r4: the store queue is write only,
+	// so this is ordinary memory and the writes must stay ordinary writes
+	mock_reset();
+	RuntimeBlockInfo b2 = mkblk();
+	b2.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b2, reg_r4, 8);
+	b2.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r4), P(), 4));
+	b2.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b2);
+	verify(b2.oplist.back().flags != 0x1337);
+	verify(sq_marked_writes(b2) == 0);
+
+	// a read of any size counts, and one before the writes counts too
+	for (u32 sz = 1; sz <= 8; sz *= 2)
+	{
+		mock_reset();
+		RuntimeBlockInfo b3 = mkblk();
+		b3.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+		b3.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r4), P(), sz));
+		mk_sq_writes(&b3, reg_r4, 8);
+		b3.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+		sq_pref(&b3);
+		verify(b3.oplist.back().flags != 0x1337);
+		verify(sq_marked_writes(b3) == 0);
+	}
+
+	// a read through some other register leaves the match alone
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	b4.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b4, reg_r4, 8);
+	b4.oplist.push_back(OP(shop_readm, R(reg_r2), R(reg_r5), P(), 4));
+	b4.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b4);
+	verify(b4.oplist.back().flags == 0x1337);
+	verify(sq_marked_writes(b4) == 8);
+
+	// too little written to look like a store queue fill
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_mov32, R(reg_r4), I(0xE0000000)));
+	mk_sq_writes(&b5, reg_r4, 1);
+	b5.oplist.push_back(OP(shop_pref, P(), R(reg_r4)));
+	sq_pref(&b5);
+	verify(b5.oplist.back().flags != 0x1337);
+	verify(sq_marked_writes(b5) == 0);
+}
+
 static void t_imm_literal_bake()
 {
 	// pc-relative literals arrive from the decoder with an immediate base;
@@ -1522,6 +1599,7 @@ int main(int argc, char** argv)
 	t_dse();
 	t_ftrv_known_w();
 	t_readm_pair_fusion();
+	t_sq_pref();
 	t_imm_literal_bake();
 	t_rom_bake();
 	t_baking_disabled();

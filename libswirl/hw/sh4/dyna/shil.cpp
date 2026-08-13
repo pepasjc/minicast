@@ -84,6 +84,22 @@ void PromoteConstAddress(RuntimeBlockInfo* blk)
 	}
 }
 
+//The store queue is write only: whatever the writes before the pref look like,
+//a register that anything in the block loads through is not pointing at one,
+//and marking its writes would send them to the sq buffer instead of memory.
+bool sq_reg_is_read(RuntimeBlockInfo* blk, Sh4RegType rt)
+{
+	for (size_t i=0;i<blk->oplist.size();i++)
+	{
+		shil_opcode* op=&blk->oplist[i];
+
+		if (op->op==shop_readm && op->rs1.is_reg() && op->rs1._reg==rt)
+			return true;
+	}
+
+	return false;
+}
+
 void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 {
 	u32 data=0;
@@ -129,7 +145,7 @@ void sq_pref(RuntimeBlockInfo* blk)
 	for (int i=0;i<blk->oplist.size();i++)
 	{
 		blk->oplist[i].flags2=0;
-		if (blk->oplist[i].op==shop_pref)
+		if (blk->oplist[i].op==shop_pref && !sq_reg_is_read(blk,blk->oplist[i].rs1._reg))
 			sq_pref(blk,i,blk->oplist[i].rs1._reg,false);
 	}
 }

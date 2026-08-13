@@ -170,6 +170,7 @@ struct shil_param
 	bool is_r32f() const { return type == FMT_F32; }
 	bool is_r64f() const { return type == FMT_F64; }
 	bool is_r32() const { return is_r32i() || is_r32f(); }
+	u32 is_r32fv() const { return type >= FMT_V2 ? count() : 0; }
 
 	bool is_imm_s16() const { return is_imm() && (s32)_imm >= -32768 && (s32)_imm <= 32767; }
 
