@@ -20,6 +20,7 @@ struct TestAlloc : RegAlloc<int, int, false>
 		memset(Rg, 0, sizeof(Rg));
 		memset(Rf, 0, sizeof(Rf));
 		spills = 0;
+		opt_pair_fpu_spans = true;
 	}
 
 	virtual void Preload(u32 reg, int nreg) { Rg[nreg] = ctx[reg]; }
@@ -263,7 +264,7 @@ static void dump_block(RuntimeBlockInfo* blk)
 	}
 }
 
-static u64 g_elided, g_movs, g_spills, g_fail_ctx;
+static u64 g_elided, g_movs, g_spills, g_fail_ctx, g_vecops, g_vecruns;
 static RuntimeBlockInfo* g_cur_blk;
 static u64 g_cur_seed;
 static TestAlloc* g_cur_alloc;
@@ -299,6 +300,32 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	alloc->DoAlloc(blk, gprs, fprs);
 	g_spills += alloc->spills;
 	alloc->spills = 0;
+
+	// how often an exploded operand ended up in consecutive, in-order host regs
+	// (an even base): that's what lets the backend fold its context accesses
+	for (size_t opid = 0; opid < blk->oplist.size(); opid++)
+	{
+		shil_opcode* op = &blk->oplist[opid];
+		shil_param* ps[] = { &op->rd, &op->rd2, &op->rs1, &op->rs2, &op->rs3 };
+
+		for (int j = 0; j < 5; j++)
+		{
+			if (!ps[j]->is_reg() || ps[j]->count() < 2 || !alloc->ExplodeVec(op, *ps[j]))
+				continue;
+
+			alloc->current_opid = (u32)opid;
+
+			int base = alloc->mapf((Sh4RegType)ps[j]->_reg);
+			bool run = (base & 1) == 0;
+
+			for (u32 e = 1; e < ps[j]->count(); e++)
+				run &= alloc->mapf((Sh4RegType)(ps[j]->_reg + e)) == base + (int)e;
+
+			g_vecops++;
+			if (run)
+				g_vecruns++;
+		}
+	}
 
 	u64 arch[sh4_reg_count];
 	u64 next_val = 0x1000000;
@@ -434,7 +461,7 @@ int main(int argc, char** argv)
 	for (int alias = 0; alias <= 1; alias++)
 	for (int reuse = 0; reuse <= 1; reuse++)
 	{
-		g_elided = g_movs = g_spills = 0;
+		g_elided = g_movs = g_spills = g_vecops = g_vecruns = 0;
 		for (u32 pi = 0; pi < npools; pi++)
 		{
 			TestAlloc alloc;
@@ -453,9 +480,10 @@ int main(int argc, char** argv)
 				run_block(&alloc, &blk, pools[pi].ngpr, pools[pi].nfpr);
 			}
 		}
-		printf("alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu)\n",
+		printf("alias=%d reuse=%d: OK  (movs %llu, elided %llu, spills %llu, vec operands %llu, in one run %llu)\n",
 			alias, reuse, (unsigned long long)g_movs, (unsigned long long)g_elided,
-			(unsigned long long)g_spills);
+			(unsigned long long)g_spills, (unsigned long long)g_vecops,
+			(unsigned long long)g_vecruns);
 	}
 
 	printf("all passed\n");

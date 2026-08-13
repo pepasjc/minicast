@@ -283,6 +283,83 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 		//any mapped dest, so dests may share a host reg with a dying source
 		opt_alias_mov=true;
 		opt_reuse_dead=true;
+
+		//s2k/s2k+1 are the halves of dk: exploded f64/fv operands in an
+		//in-order pair move to and from the context in one 64 bit access
+		opt_pair_fpu_spans=true;
+	}
+
+	//Preload_FPU/Writeback_FPU queue up while an op's preamble/postamble is
+	//emitted, so an aligned sh4 pair sitting in an in-order host pair can go
+	//as a single vldr.64/vstr.64 instead of two 32 bit ones
+	struct CtxMove
+	{
+		u32 reg;
+		eFSReg nreg;
+	};
+
+	vector<CtxMove> pend_ld,pend_st;
+	bool batching=false;
+
+	static bool pairable(const CtxMove& lo, const CtxMove& hi)
+	{
+		//consecutive fpu regs starting on an even one (so they are contiguous
+		//in the context and inside the same bank), in an even/odd host pair
+		return hi.reg==lo.reg+1 && ((lo.reg-reg_fr_0)&1)==0 &&
+			(lo.nreg&1)==0 && hi.nreg==(eFSReg)(lo.nreg+1);
+	}
+
+	void EmitMoves(vector<CtxMove>& l, bool store)
+	{
+		std::sort(l.begin(),l.end(),[](const CtxMove& a,const CtxMove& b){ return a.reg<b.reg; });
+
+		for (size_t i=0;i<l.size();)
+		{
+			const s32 ofs=((u8*)GetRegPtr(l[i].reg)-sh4_dyna_rcb)/4;
+
+			if (i+1<l.size() && pairable(l[i],l[i+1]))
+			{
+				eFDReg d=(eFDReg)(l[i].nreg/2);
+
+				if (store)
+					VSTR(d,r8,ofs);
+				else
+					VLDR(d,r8,ofs);
+
+				i+=2;
+			}
+			else
+			{
+				if (store)
+					VSTR(l[i].nreg,r8,ofs);
+				else
+					VLDR(l[i].nreg,r8,ofs);
+
+				i++;
+			}
+		}
+
+		l.clear();
+	}
+
+	void OpBegin(shil_opcode* op,int opid)
+	{
+		batching=true;
+		RegAlloc::OpBegin(op,opid);
+		batching=false;
+
+		//the flushes first: the op body reads those operands from the context
+		EmitMoves(pend_st,true);
+		EmitMoves(pend_ld,false);
+	}
+
+	void OpEnd(shil_opcode* op)
+	{
+		batching=true;
+		RegAlloc::OpEnd(op);
+		batching=false;
+
+		EmitMoves(pend_st,true);
 	}
 
 	//ftrv/fipr consume their fv operands element-wise via mapfv(); their
@@ -332,12 +409,28 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 
 	virtual void Preload_FPU(u32 reg,eFSReg nreg)
 	{
+		CtxMove m={reg,nreg};
+
+		if (batching)
+		{
+			pend_ld.push_back(m);
+			return;
+		}
+
 		const s32 shRegOffs = (u8*)GetRegPtr(reg)-sh4_dyna_rcb ;
 
 		VLDR((nreg),r8,shRegOffs/4);
 	}
 	virtual void Writeback_FPU(u32 reg,eFSReg nreg)
 	{
+		CtxMove m={reg,nreg};
+
+		if (batching)
+		{
+			pend_st.push_back(m);
+			return;
+		}
+
 		const s32 shRegOffs = (u8*)GetRegPtr(reg)-sh4_dyna_rcb ;
 
 		VSTR((nreg),r8,shRegOffs/4);
@@ -760,7 +853,10 @@ void vmem_slowpath(eReg raddr, eReg rt, eFSReg ft, eFDReg fd, mem_op_type optp, 
 		else if (optp == SZ_64F) VMOV(r2, r3, fd);
 	}
 
-	verify(optp != SZ_64F || fd == d0 || fd == d14);
+	//the value rides in fd across the call: either a staging register or the
+	//pair the operand is allocated in, which is always inside the callee-saved
+	//d8-d15 bank (see param_dreg)
+	verify(optp != SZ_64F || fd == d0 || (fd >= d8 && fd <= d15));
 
 	u32 funct = 0;
 
@@ -824,12 +920,30 @@ eReg GenMemAddr(shil_opcode* op,eReg raddr=r0)
 	return raddr;
 }
 
-//64-bit fpu values always move through d0/d14: the vldr/vstr of a memop is
-//what ngen_Rewrite patches into a handler call, and both the handler and the
-//slowpath hand the value over in that same d register. So the staging reg
-//stays, and these only replace the context store/load that used to bracket it
-//with vmovs into/out of the halves the allocator gave the f64 param
-//(ExplodeVec). Unallocated halves keep using the context.
+//The d register an exploded f64 param lives in, or -1 when its halves didn't
+//land in an in-order even/odd pair (see opt_pair_fpu_spans). Such a pair can
+//serve as a memop's value register directly: the fpu pool is s16-s31, which is
+//exactly d8-d15, the bank AAPCS preserves across calls -- so it survives both
+//the slowpath call and the handler call ngen_Rewrite may patch the fastpath
+//into (the handler moves the value through whatever d register it finds in the
+//faulting instruction).
+static eFDReg param_dreg(const shil_param& prm)
+{
+	if (!prm.is_r64f() || !reg.IsAllocf(prm,0) || !reg.IsAllocf(prm,1))
+		return (eFDReg)-1;
+
+	eFSReg h0=reg.mapfv(prm,0),h1=reg.mapfv(prm,1);
+
+	if ((h0&1)!=0 || h1!=(eFSReg)(h0+1))
+		return (eFDReg)-1;
+
+	return (eFDReg)(h0/2);
+}
+
+//...otherwise the value moves through the d0/d14 staging register and these
+//replace the context store/load that used to bracket the memop with vmovs
+//into/out of the halves the allocator gave the f64 param. Unallocated halves
+//keep using the context.
 static void d64_to_param(eFDReg d64, const shil_param& prm)
 {
 	verify(prm.is_r64f());
@@ -862,10 +976,11 @@ static void load64_to_param(const shil_param& prm, eReg base, s32 ofs, eFDReg d6
 
 	if (reg.IsAllocf(prm,0) && reg.IsAllocf(prm,1))
 	{
+		eFDReg pair=param_dreg(prm);
 		eFSReg h0=reg.mapfv(prm,0),h1=reg.mapfv(prm,1);
 
-		if ((h0&1)==0 && h1==(eFSReg)(h0+1))
-			VLDR((eFDReg)(h0/2),base,ofs);
+		if (pair!=(eFDReg)-1)
+			VLDR(pair,base,ofs);
 		else
 		{
 			VLDR(h0,base,ofs);
@@ -1059,11 +1174,17 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 					{
-						eFDReg d64=fpu_temps_avail?d14:d0;
-						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
-						VLDR(d64,r1,0);	//staged in d64: this is the rewritable op
+						//loads straight into the mapped pair when there is one,
+						//otherwise stages in d64; either way this vldr is the
+						//op ngen_Rewrite patches
+						eFDReg pair=param_dreg(op->rd);
+						eFDReg d64=pair!=(eFDReg)-1?pair:(fpu_temps_avail?d14:d0);
 
-						d64_to_param(d64,op->rd);
+						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
+						VLDR(d64,r1,0);
+
+						if (pair==(eFDReg)-1)
+							d64_to_param(d64,op->rd);
 						break;
 					}
 					}
@@ -1088,9 +1209,15 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 						break;
 
 					case SZ_64F:
-						vmem_slowpath(raddr, r0, f0, d64, optp, true);
-						d64_to_param(d64,op->rd);
+					{
+						eFDReg pair=param_dreg(op->rd);
+
+						vmem_slowpath(raddr, r0, f0, pair!=(eFDReg)-1?pair:d64, optp, true);
+
+						if (pair==(eFDReg)-1)
+							d64_to_param(d64,op->rd);
 						break;
+					}
 					}
 				}
 			}
@@ -1105,9 +1232,18 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			eReg raddr=GenMemAddr(op);
 
-			//the value is staged in d64: the store below is the rewritable op
+			//stores straight out of the mapped pair when there is one, else the
+			//value is staged in d64; either way the store below is the op
+			//ngen_Rewrite patches
 			if (optp == SZ_64F)
-				param_to_d64(d64,op->rs2);
+			{
+				eFDReg pair=param_dreg(op->rs2);
+
+				if (pair!=(eFDReg)-1)
+					d64=pair;
+				else
+					param_to_d64(d64,op->rs2);
+			}
 
 			if (_nvmem_enabled()) {
 				BIC(r1,raddr,0xE0000000);
@@ -2513,7 +2649,8 @@ struct Arm32NGenBackend: NGenBackend
 				else if (optp==SZ_64F) VMOV(r2,r3,fd);
 			}
 
-			verify(optp!=SZ_64F || fd==d0 || fd==d14);
+			//staging register, or the callee-saved pair the operand lives in
+			verify(optp!=SZ_64F || fd==d0 || (fd>=d8 && fd<=d15));
 
 			u32 funct=0;
 

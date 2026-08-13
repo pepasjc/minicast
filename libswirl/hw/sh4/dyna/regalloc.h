@@ -11,6 +11,7 @@
 
 #include <set>
 #include <deque>
+#include <algorithm>
 
 static inline bool operator < (const shil_param &lhs, const shil_param &rhs)
 {
@@ -244,6 +245,14 @@ struct RegAlloc
 	//have this for free; multi-instruction sequences must be audited).
 	bool opt_alias_mov=false;   //coalesce reg-reg movs: alias the dst span onto the src host reg
 	bool opt_reuse_dead=false;  //spans starting at an op may take a host reg that dies at that op
+
+	//Elements of an exploded fpu operand do best in consecutive, in-order host
+	//registers, for a backend that can move a register pair in one instruction
+	//(on arm32 s2k/s2k+1 are the halves of dk): the two context accesses at the
+	//span ends fold into one, and the operand itself can be loaded or stored as
+	//a pair. Best effort -- elements fall back to one-at-a-time allocation when
+	//no aligned run is free.
+	bool opt_pair_fpu_spans=false;
 
 	u32 current_opid;
 	u32 preload_fpu,preload_gpr;
@@ -482,6 +491,93 @@ struct RegAlloc
 			return SpanNRegfIntr(opid,spn->nregf)==1;
 		else
 			return SpanNRegIntr(opid,spn->nreg)==1;
+	}
+
+	//takes n consecutive host fpu regs, base aligned to 2, out of the free list.
+	//Regs in `avoid` are off limits: they were handed back by a span dying at
+	//this very op, and a preload (which runs at OpBegin, before the op body)
+	//would clobber a value that body still has to read.
+	bool TakeFpuRun(deque<nregf_t>& regsf,const vector<nregf_t>& avoid,u32 n,nregf_t* out)
+	{
+		for (size_t i=0;i<regsf.size();i++)
+		{
+			u32 base=(u32)regsf[i];
+
+			if ((base&1)!=0)
+				continue;
+
+			u32 have=0;
+
+			for (u32 k=0;k<n;k++)
+			{
+				nregf_t want=(nregf_t)(base+k);
+
+				if (find(avoid.begin(),avoid.end(),want)!=avoid.end())
+					break;
+
+				if (find(regsf.begin(),regsf.end(),want)==regsf.end())
+					break;
+
+				have++;
+			}
+
+			if (have!=n)
+				continue;
+
+			for (u32 k=0;k<n;k++)
+			{
+				out[k]=(nregf_t)(base+k);
+				regsf.erase(find(regsf.begin(),regsf.end(),out[k]));
+			}
+
+			return true;
+		}
+
+		return false;
+	}
+
+	//Gives the elements of this op's exploded fpu operands consecutive, in-order
+	//host registers when a free run is available -- see opt_pair_fpu_spans. Only
+	//operands whose elements all start here can be placed; anything already live
+	//keeps the registers it has, and a failed placement just falls through to
+	//the plain one-at-a-time allocation.
+	void AllocFpuRuns(shil_opcode* op,u32 opid,deque<nregf_t>& regsf,const vector<nregf_t>& freed_now)
+	{
+		const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+		for (int i=0;i<5;i++)
+		{
+			const shil_param& prm=*prms[i];
+
+			if (!prm.is_reg() || prm.count()<2 || prm.count()>4 || !ExplodeVec(op,prm))
+				continue;
+
+			RegSpan* el[4];
+			bool placeable=true;
+			bool preload=false;
+
+			for (u32 e=0;e<prm.count();e++)
+			{
+				el[e]=FindSpan((Sh4RegType)(prm._reg+e),opid);
+
+				if (!el[e]->begining((int)opid) || el[e]->nregf!=(nregf_t)-1)
+					placeable=false;
+				else
+					preload|=el[e]->preload;
+			}
+
+			if (!placeable)
+				continue;
+
+			static const vector<nregf_t> none;
+			nregf_t nr[4];
+
+			if (!TakeFpuRun(regsf,preload?freed_now:none,prm.count(),nr))
+				continue;
+
+			for (u32 e=0;e<prm.count();e++)
+				el[e]->nregf=nr[e];
+		}
 	}
 
 	RegSpan* FindSpan(Sh4RegType reg, u32 opid)
@@ -849,6 +945,8 @@ struct RegAlloc
 				}
 			}
 
+			vector<nregf_t> freed_now;
+
 			if (opt_reuse_dead)
 			{
 				//return regs dying at this op to the back of the pool before
@@ -863,16 +961,26 @@ struct RegAlloc
 						spn->freed_early=true;
 
 						if (spn->fpr)
+						{
 							regsf.push_back(spn->nregf);
+							freed_now.push_back(spn->nregf);
+						}
 						else
 							regs.push_back(spn->nreg);
 					}
 				}
 			}
 
+			if (opt_pair_fpu_spans)
+				AllocFpuRuns(&block->oplist[opid],(u32)opid,regsf,freed_now);
+
 			for (u32 sid=0;sid<all_spans.size();sid++)
 			{
 				RegSpan* spn=all_spans[sid];
+
+				//AllocFpuRuns may have served this one already
+				if (spn->fpr && spn->nregf!=(nregf_t)-1)
+					continue;
 
 				if (spn->begining((int)opid) && spn!=alias_dst)
 				{
