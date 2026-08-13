@@ -68,11 +68,13 @@ enum shilop
 	shop_add,
 	shop_sbc,
 	shop_fadd,
-	// vector ops: the test allocator explodes their V4 params (like arm32
-	// does for the real ftrv/fipr); V16 stays a memory operand
+	// vector ops: the test allocator explodes their V4 and F64 params (like
+	// arm32 does for ftrv/fipr and for the f64 movs/memops); V16 stays a
+	// memory operand
 	shop_ftrv,
 	shop_fipr,
-	shop_fsca,	// F64 pair write from a scalar source, never exploded
+	shop_fsca,	// exploded F64 pair write from a scalar source
+	shop_frswap,	// V16 read-write of both banks: spans must flush and die
 };
 
 struct shil_param
@@ -86,6 +88,7 @@ struct shil_param
 	bool is_reg() const { return type >= FMT_I32; }
 	bool is_r32i() const { return type == FMT_I32; }
 	bool is_r32f() const { return type == FMT_F32; }
+	bool is_r64f() const { return type == FMT_F64; }
 	bool is_r32() const { return is_r32i() || is_r32f(); }
 
 	u32 count() const

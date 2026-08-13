@@ -28,10 +28,16 @@ struct TestAlloc : RegAlloc<int, int, false>
 	virtual void Writeback_FPU(u32 reg, int nreg) { ctx[reg] = Rf[nreg]; }
 
 	// mirror the arm32 backend: ftrv/fipr fv operands become 4 allocatable
-	// f32 spans; every other multi-reg param stays a memory operand
+	// f32 spans, and the f64 pair of a mov64/readm/writem/fsca becomes 2;
+	// every other multi-reg param stays a memory operand
 	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
-		return (op->op == shop_ftrv || op->op == shop_fipr) && prm.count() == 4;
+		if ((op->op == shop_ftrv || op->op == shop_fipr) && prm.count() == 4)
+			return true;
+
+		return prm.is_r64f() &&
+			(op->op == shop_mov64 || op->op == shop_readm ||
+			 op->op == shop_writem || op->op == shop_fsca);
 	}
 };
 
@@ -73,6 +79,21 @@ static shil_param mkvec(Sh4RegType r, u32 fmt)
 	return p;
 }
 
+// ops also reach into the xf bank now and then: those spans are what the
+// non-exploded xmtrx operand of an ftrv flushes (AM_FLUSH)
+static Sh4RegType rnd_fpr()
+{
+	u32 i = rnd_below(16);
+	return (Sh4RegType)((rnd_below(4) == 0 ? reg_xf_0 : reg_fr_0) + i);
+}
+
+// even-aligned base of a dr/xd pair
+static Sh4RegType rnd_fpr_pair()
+{
+	u32 i = rnd_below(8) * 2;
+	return (Sh4RegType)((rnd_below(4) == 0 ? reg_xf_0 : reg_fr_0) + i);
+}
+
 // pick `n` distinct regs from a pool (params of one op must fit in the host pool)
 static void pick_distinct(const Sh4RegType* pool, u32 pool_sz, u32 n, Sh4RegType* out)
 {
@@ -99,7 +120,7 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 	{
 		shil_opcode op;
 		Sh4RegType r[5];
-		u32 kind = rnd_below(14);
+		u32 kind = rnd_below(17);
 
 		if (kind == 10 && nfpr >= 4) // exploded vector op, like ftrv
 		{
@@ -123,19 +144,47 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			blk->oplist.push_back(op);
 			continue;
 		}
-		if (kind == 12 && nfpr >= 2) // non-exploded vector: fpu spans must flush/die
+		if (kind == 12 && nfpr >= 4) // exploded f64 pair copy: up to 4 live halves
 		{
 			op.op = shop_mov64;
-			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
-			op.rs1 = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
+			op.rs1 = mkvec(rnd_fpr_pair(), FMT_F64);
 			blk->oplist.push_back(op);
 			continue;
 		}
-		if (kind == 13 && nfpr >= 2) // fsca-like: F64 pair write from a gpr source
+		if (kind == 13 && nfpr >= 2) // fsca: exploded F64 pair write from a gpr source
 		{
 			op.op = shop_fsca;
-			op.rd = mkvec(fpr_pool[rnd_below(8) * 2], FMT_F64);
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
 			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 14 && nfpr >= 2) // 64 bit fpu read: exploded pair dest, gpr address
+		{
+			op.op = shop_readm;
+			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
+			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		if (kind == 15 && nfpr >= 2) // 64 bit fpu write: exploded pair source, gpr address
+		{
+			op.op = shop_writem;
+			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+			op.rs2 = mkvec(rnd_fpr_pair(), FMT_F64);
+			blk->oplist.push_back(op);
+			continue;
+		}
+		// frswap swaps both banks wholesale: every fpu span has to flush and
+		// die there. Kept rare -- it wipes the fpu state the other ops build up
+		if (kind == 16 && rnd_below(4) == 0)
+		{
+			op.op = shop_frswap;
+			op.rd = mkvec(reg_xf_0, FMT_V16);
+			op.rd2 = mkvec(reg_fr_0, FMT_V16);
+			op.rs1 = mkvec(reg_fr_0, FMT_V16);
+			op.rs2 = mkvec(reg_xf_0, FMT_V16);
 			blk->oplist.push_back(op);
 			continue;
 		}
@@ -148,8 +197,8 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			bool df = cls & 1, sf = cls & 2;
 			if ((df || sf) && nfpr < 1) { df = sf = false; }
 			op.op = shop_mov32;
-			Sh4RegType dr = df ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
-			Sh4RegType sr = sf ? fpr_pool[rnd_below(16)] : gpr_pool[rnd_below(8)];
+			Sh4RegType dr = df ? rnd_fpr() : gpr_pool[rnd_below(8)];
+			Sh4RegType sr = sf ? rnd_fpr() : gpr_pool[rnd_below(8)];
 			op.rd = mkreg(dr, df);
 			op.rs1 = mkreg(sr, sf);
 		}

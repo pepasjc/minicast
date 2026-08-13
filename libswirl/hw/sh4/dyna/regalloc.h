@@ -135,6 +135,22 @@ struct RegAlloc
 			return -1;
 		}
 
+		//the next access the op body needs this register for: a flush reads
+		//the operand from the context, so it doesn't count
+		int nacc_use(int pos)
+		{
+			if (!contains(pos))
+				return -1;
+
+			for (size_t i=0;i<accesses.size();i++)
+			{
+				if (accesses[i].pos>(u32)pos && accesses[i].am!=AM_FLUSH)
+					return accesses[i].pos;
+			}
+
+			return -1;
+		}
+
 		int nacc_w(int pos)
 		{
 			if (!contains(pos))
@@ -411,9 +427,10 @@ struct RegAlloc
 		return is_fpr && (op->rd.count()>=2 || op->rd2.count()>=2 || op->rs1.count()>=2 ||  op->rs2.count()>=2 || op->rs3.count()>=2 );
 	}
 
-	//opt-in per-op explode of 4-wide fpu vectors into individually allocatable
-	//f32 spans. The backend must then access the elements via mapfv() in that
-	//op's emitter -- see ExplodeVec() overrides.
+	//opt-in per-op explode of multi-reg fpu operands (f64 pairs, 4-wide
+	//vectors) into individually allocatable f32 spans. The backend must then
+	//access the elements via mapfv() in that op's emitter -- see the
+	//ExplodeVec() overrides.
 	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
 		return false;
@@ -423,7 +440,7 @@ struct RegAlloc
 	{
 		bool explode;
 		if (regs.count()==2)
-			explode = explode_spans;
+			explode = explode_spans || (regs.is_reg() && ExplodeVec(op,regs));
 		else if (regs.count()==4)
 			explode = regs.is_reg() && ExplodeVec(op,regs);
 		else
@@ -1068,6 +1085,18 @@ struct RegAlloc
 	}
 
 
+	//A span can be cut at an op that doesn't use its host register: one it
+	//doesn't access at all, or a flush -- there the operand is read from the
+	//context, so ending the span at its previous access (which writes back any
+	//dirty value) and re-loading it at the next one is transparent. Cutting
+	//needs a previous access to end on.
+	bool CanSplit(RegSpan* spn, u32 opid)
+	{
+		AccessMode am=spn->cacc_am(opid);
+
+		return (am==AM_NONE || am==AM_FLUSH) && spn->pacc(opid)!=-1;
+	}
+
 	void SplitSpans(u32 cc,u32 reg_cc_max ,bool fpr,u32 opid)
 	{
 		bool was_large=false;	//this control prints
@@ -1086,9 +1115,12 @@ struct RegAlloc
 
 				if (spn->contains(opid) && fpr==spn->fpr)
 				{
-					if (!spn->cacc(opid))
+					if (CanSplit(spn,opid))
 					{
-						if (!last_nacc || spn->nacc(opid)>last_nacc->nacc(opid))
+						//a span with no further use is the cheapest to cut: it
+						//just ends early, no reload
+						if (!last_nacc || spn->nacc_use(opid)==-1 ||
+							(last_nacc->nacc_use(opid)!=-1 && spn->nacc_use(opid)>last_nacc->nacc_use(opid)))
 							last_nacc=spn;
 
 						if (!last_pacc || spn->pacc(opid)<last_pacc->pacc(opid))
@@ -1099,24 +1131,41 @@ struct RegAlloc
 				}
 			}
 
+			//nothing left to cut: this op alone needs more registers than the
+			//host has
+			verify(last_nacc!=0);
+
 			//printf("Last pacc: %d, vlen %d | reg r%d\n",last_pacc->nacc(opid)-opid,last_pacc->nacc(opid)-last_pacc->pacc(opid),last_pacc->regstart);
 			//printf("Last nacc: %d, vlen %d | reg r%d\n",last_nacc->nacc(opid)-opid,last_nacc->nacc(opid)-last_nacc->pacc(opid),last_nacc->regstart);
 
-			RegSpan* spn= new RegSpan(*last_nacc);
-			spn->start=last_nacc->nacc(opid);
+			//the tail picks up at the next access that needs a register; any
+			//flush in between is served from the context
+			int tail=last_nacc->nacc_use(opid);
+
+			//the tail becomes a span of its own, re-loaded at its first access
+			//(the context is current: the head writes back at its own end)
+			if (tail!=-1)
+			{
+				RegSpan* spn= new RegSpan(*last_nacc);
+				spn->start=tail;
+
+				spn->trim_access();
+
+				spn->preload=spn->NeedsPL();
+				spn->writeback=spn->NeedsWB();
+
+				//add it to the span list !
+				all_spans.push_back(spn);
+				spills++;
+			}
+
 			last_nacc->end=last_nacc->pacc(opid);
 
 			//trim the access arrays as required ..
-			spn->trim_access();
 			last_nacc->trim_access();
 
-			spn->preload=spn->NeedsPL();
-			spn->writeback=spn->NeedsWB();
 			last_nacc->writeback=last_nacc->NeedsWB();
 
-			//add it to the span list !
-			all_spans.push_back(spn);
-			spills++;
 			cc--;
 		}
 	}

@@ -289,7 +289,22 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 	//emitters require this (no memory fallback), see shop_ftrv/shop_fipr
 	virtual bool ExplodeVec(shil_opcode* op, const shil_param& prm)
 	{
-		return (op->op==shop_ftrv || op->op==shop_fipr) && prm.count()==4;
+		if ((op->op==shop_ftrv || op->op==shop_fipr) && prm.count()==4)
+			return true;
+
+		//f64 pairs that are pure register traffic on the fpu side: the halves
+		//become two allocated singles, so fmov DRm,DRn is (at most) two vmovs
+		//and the 64-bit memops/fsca move their value between the d0/d14
+		//staging register and the mapped halves instead of the context. The
+		//emitters keep their memory paths, so this stays a pure optimisation.
+		//(the only f64 param of a memop is its value: rd for readm, rs2 for
+		//writem -- the addresses are i32/imm)
+		if (prm.is_r64f() &&
+			(op->op==shop_mov64 || op->op==shop_readm || op->op==shop_writem ||
+			 op->op==shop_fsca))
+			return true;
+
+		return false;
 	}
 
 	virtual eFSReg FpuMap(u32 reg)
@@ -809,6 +824,97 @@ eReg GenMemAddr(shil_opcode* op,eReg raddr=r0)
 	return raddr;
 }
 
+//64-bit fpu values always move through d0/d14: the vldr/vstr of a memop is
+//what ngen_Rewrite patches into a handler call, and both the handler and the
+//slowpath hand the value over in that same d register. So the staging reg
+//stays, and these only replace the context store/load that used to bracket it
+//with vmovs into/out of the halves the allocator gave the f64 param
+//(ExplodeVec). Unallocated halves keep using the context.
+static void d64_to_param(eFDReg d64, const shil_param& prm)
+{
+	verify(prm.is_r64f());
+
+	if (!reg.IsAllocf(prm,0) && !reg.IsAllocf(prm,1))
+	{
+		VSTR(d64,r8,prm.reg_nofs()/4);
+		return;
+	}
+
+	for (u32 i=0;i<2;i++)
+	{
+		eFSReg half=(eFSReg)(d64*2+i);
+
+		if (reg.IsAllocf(prm,i))
+			VMOV(reg.mapfv(prm,i),half);
+		else
+			VSTR(half,r8,prm.reg_nofs()/4+i);
+	}
+}
+
+//loads the 64 bit pair at [base+ofs] (word offset) into an f64 param. Unlike
+//the memops, this one can pick its own instructions: nothing rewrites it, so
+//the pair goes straight into the mapped halves. One vldr.64 when the allocator
+//happened to hand out an even/odd pair, two vldr.32 otherwise -- either way no
+//vmovs, and the d64 staging register is only needed if nothing is mapped.
+static void load64_to_param(const shil_param& prm, eReg base, s32 ofs, eFDReg d64)
+{
+	verify(prm.is_r64f());
+
+	if (reg.IsAllocf(prm,0) && reg.IsAllocf(prm,1))
+	{
+		eFSReg h0=reg.mapfv(prm,0),h1=reg.mapfv(prm,1);
+
+		if ((h0&1)==0 && h1==(eFSReg)(h0+1))
+			VLDR((eFDReg)(h0/2),base,ofs);
+		else
+		{
+			VLDR(h0,base,ofs);
+			VLDR(h1,base,ofs+1);
+		}
+		return;
+	}
+
+	if (!reg.IsAllocf(prm,0) && !reg.IsAllocf(prm,1))
+	{
+		VLDR(d64,base,ofs);
+		VSTR(d64,r8,prm.reg_nofs()/4);
+		return;
+	}
+
+	for (u32 i=0;i<2;i++)
+	{
+		if (reg.IsAllocf(prm,i))
+			VLDR(reg.mapfv(prm,i),base,ofs+i);
+		else
+		{
+			eFSReg t=fpu_temps_avail?f28:f0;
+			VLDR(t,base,ofs+i);
+			VSTR(t,r8,prm.reg_nofs()/4+i);
+		}
+	}
+}
+
+static void param_to_d64(eFDReg d64, const shil_param& prm)
+{
+	verify(prm.is_r64f());
+
+	if (!reg.IsAllocf(prm,0) && !reg.IsAllocf(prm,1))
+	{
+		VLDR(d64,r8,prm.reg_nofs()/4);
+		return;
+	}
+
+	for (u32 i=0;i<2;i++)
+	{
+		eFSReg half=(eFSReg)(d64*2+i);
+
+		if (reg.IsAllocf(prm,i))
+			VMOV(half,reg.mapfv(prm,i));
+		else
+			VLDR(half,r8,prm.reg_nofs()/4+i);
+	}
+}
+
 void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging, bool optimise)
 {
 	switch(op->op)
@@ -955,9 +1061,9 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					{
 						eFDReg d64=fpu_temps_avail?d14:d0;
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
-						VLDR(d64,r1,0);	//TODO: use reg alloc
+						VLDR(d64,r1,0);	//staged in d64: this is the rewritable op
 
-						VSTR(d64,r8,op->rd.reg_nofs()/4);
+						d64_to_param(d64,op->rd);
 						break;
 					}
 					}
@@ -983,7 +1089,7 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 						vmem_slowpath(raddr, r0, f0, d64, optp, true);
-						VSTR(d64,r8,op->rd.reg_nofs()/4);
+						d64_to_param(d64,op->rd);
 						break;
 					}
 				}
@@ -999,9 +1105,9 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 			eReg raddr=GenMemAddr(op);
 
-			//TODO: use reg alloc
+			//the value is staged in d64: the store below is the rewritable op
 			if (optp == SZ_64F)
-				VLDR(d64,r8,op->rs2.reg_nofs()/4);
+				param_to_d64(d64,op->rs2);
 
 			if (_nvmem_enabled()) {
 				BIC(r1,raddr,0xE0000000);
@@ -1050,7 +1156,7 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 					if (op->flags2!=0x1337)
 					{
 						ADD(r1,r1,r8);	//3 opcodes: there's no [REG+REG] VLDR, also required for SQ
-						VSTR(d64,r1,0);	//TODO: use reg alloc
+						VSTR(d64,r1,0);
 					}
 					else
 					{
@@ -1182,9 +1288,71 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 		{
 			verify(op->rs1.is_r64() && op->rd.is_r64());
 
-			eFDReg t=fpu_temps_avail?d14:d0;
-			VLDR(t,r8,op->rs1.reg_nofs()/4);
-			VSTR(t,r8,op->rd.reg_nofs()/4);
+			//both halves are register allocated (ExplodeVec), so this is a
+			//pair of vmovs; the memory paths are only here for the (currently
+			//unreachable) case of a half that didn't get a register
+			eFSReg src[2],dst[2];
+			bool src_a[2],dst_a[2];
+
+			for (u32 i=0;i<2;i++)
+			{
+				src_a[i]=reg.IsAllocf(op->rs1,i);
+				dst_a[i]=reg.IsAllocf(op->rd,i);
+
+				if (src_a[i]) src[i]=reg.mapfv(op->rs1,i);
+				if (dst_a[i]) dst[i]=reg.mapfv(op->rd,i);
+			}
+
+			if (!src_a[0] && !src_a[1] && !dst_a[0] && !dst_a[1])
+			{
+				//nothing mapped: the old ctx-to-ctx copy, in one 64 bit pair
+				eFDReg t=fpu_temps_avail?d14:d0;
+				VLDR(t,r8,op->rs1.reg_nofs()/4);
+				VSTR(t,r8,op->rd.reg_nofs()/4);
+				break;
+			}
+
+			//a dest may have taken over the host reg of a source that dies
+			//here (opt_reuse_dead), so a half must not be written while the
+			//other half still has to read that register
+			u32 order[2]={0,1};
+
+			if (dst_a[0] && src_a[1] && dst[0]==src[1])
+			{
+				if (dst_a[1] && src_a[0] && dst[1]==src[0])
+				{
+					//the pair is swapped: break the cycle through a scratch
+					eFSReg t=fpu_temps_avail?f28:f0;
+					VMOV(t,src[1]);
+					src[1]=t;
+				}
+				else
+				{
+					order[0]=1;
+					order[1]=0;
+				}
+			}
+
+			for (u32 k=0;k<2;k++)
+			{
+				u32 i=order[k];
+
+				if (dst_a[i] && src_a[i])
+				{
+					if (dst[i]!=src[i])
+						VMOV(dst[i],src[i]);
+				}
+				else if (dst_a[i])
+					VLDR(dst[i],r8,op->rs1.reg_nofs()/4+i);
+				else if (src_a[i])
+					VSTR(src[i],r8,op->rd.reg_nofs()/4+i);
+				else
+				{
+					eFSReg t=fpu_temps_avail?f28:f0;
+					VLDR(t,r8,op->rs1.reg_nofs()/4+i);
+					VSTR(t,r8,op->rd.reg_nofs()/4+i);
+				}
+			}
 			break;
 		}
 
@@ -1637,8 +1805,6 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 		case shop_fsca:
 			{
-				reg.writeback_fpu+=2;
-
 				//r1: base ptr
 				MOVW(r1,((unat)sin_table)&0xFFFF);
 				UXTH(r0,reg.mapg(op->rs1));
@@ -1656,9 +1822,7 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 				//ADD(r0,r1,r0); //EMITTER: Todo, add with shifted !
 				ADD(r0,r1,r0, S_LSL, 3);
 
-				eFDReg t=fpu_temps_avail?d14:d0;
-				VLDR(t,r0,0);
-				VSTR(t,r8,op->rd.reg_nofs()/4);
+				load64_to_param(op->rd,r0,0,fpu_temps_avail?d14:d0);
 			}
 			break;
 
