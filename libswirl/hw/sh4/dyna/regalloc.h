@@ -596,14 +596,22 @@ struct RegAlloc
 		}
 	}
 
-	//does any op outside this span's range name its register? A vector operand
-	//or an interpreter fallback moves the value through the context there, so
-	//the span cannot be stretched past it
-	bool RegTouchedOutside(RuntimeBlockInfo* block, RegSpan* spn)
+	//does any op name this register at a point none of its spans covers? A
+	//vector operand or an interpreter fallback moves the value through the
+	//context there, so the register cannot be held across it
+	bool RegTouchedOutsideSpans(RuntimeBlockInfo* block, u32 reg)
 	{
 		for (size_t opid=0;opid<block->oplist.size();opid++)
 		{
-			if (spn->contains((int)opid))
+			bool covered=false;
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				if (all_spans[sid]->regstart==reg && all_spans[sid]->contains((int)opid))
+					covered=true;
+			}
+
+			if (covered)
 				continue;
 
 			shil_opcode* op=&block->oplist[opid];
@@ -611,8 +619,8 @@ struct RegAlloc
 
 			for (int i=0;i<5;i++)
 			{
-				if (p[i]->is_reg() && spn->regstart>=(u32)p[i]->_reg &&
-					spn->regstart<(u32)p[i]->_reg+p[i]->count())
+				if (p[i]->is_reg() && reg>=(u32)p[i]->_reg &&
+					reg<(u32)p[i]->_reg+p[i]->count())
 					return true;
 			}
 		}
@@ -642,14 +650,43 @@ struct RegAlloc
 		return peak;
 	}
 
-	//A looping block wants its values to live in registers for the whole block,
-	//so the back edge has nothing to write back and nothing to reload. Stretch
-	//every span that can be stretched: it must be its register's only span (a
-	//second one means the value is handed over through the context somewhere),
-	//nothing outside it may name the register, and the block must still fit in
-	//the host registers -- a stretched span is live at every op, and one that
-	//had to be split again would be no use here (a span cannot be cut at op 0,
-	//so overshooting is not recoverable either).
+	//peak liveness of one class, counting `reg` as live at every op
+	u32 PeakLiveHeld(RuntimeBlockInfo* block, bool fpr, u32 reg)
+	{
+		u32 peak=0;
+
+		for (size_t opid=0;opid<block->oplist.size();opid++)
+		{
+			u32 cc=1;	//the register we want to hold all the way through
+
+			for (u32 sid=0;sid<all_spans.size();sid++)
+			{
+				RegSpan* spn=all_spans[sid];
+
+				if (spn->fpr==fpr && spn->regstart!=reg && spn->contains((int)opid))
+					cc++;
+			}
+
+			if (cc>peak)
+				peak=cc;
+		}
+
+		return peak;
+	}
+
+	//A looping block wants its values to live in host registers for the whole
+	//block, so the back edge has nothing to write back and nothing to reload.
+	//Every register whose value never goes through the context behind a span's
+	//back gets one span over the whole block -- including registers that have
+	//several spans today, which is what a loop's rotating value looks like: read
+	//near the top, written near the bottom, and handed between the two through
+	//memory. Joining those is the whole point.
+	//
+	//What limits it is the host register file: a held register is live at every
+	//op, and one that had to be split again would be no use here (a span cannot
+	//be cut at op 0, so overshooting is not recoverable either). Registers are
+	//taken most-context-traffic-first so the ones that save the most win the
+	//space.
 	void ExtendLoopSpans(RuntimeBlockInfo* block, u32 max_g, u32 max_f)
 	{
 		for (size_t opid=0;opid<block->oplist.size();opid++)
@@ -661,51 +698,93 @@ struct RegAlloc
 
 		u32 last=(u32)block->oplist.size()-1;
 
-		//Only so many can be stretched before the block stops fitting, so take
-		//the ones that save the most first: a span that both loads and stores
-		//is two memory ops an iteration, one that only does one of them is one.
-		vector<RegSpan*> order;
+		//one candidate per register, worth the context accesses it would save
+		vector<u32> regs,saving;
 
 		for (u32 sid=0;sid<all_spans.size();sid++)
-			order.push_back(all_spans[sid]);
-
-		std::stable_sort(order.begin(),order.end(),[](RegSpan* a,RegSpan* b)
 		{
-			return (a->preload+a->writeback)>(b->preload+b->writeback);
+			RegSpan* spn=all_spans[sid];
+			size_t at=0;
+
+			while (at<regs.size() && regs[at]!=spn->regstart)
+				at++;
+
+			if (at==regs.size())
+			{
+				regs.push_back(spn->regstart);
+				saving.push_back(0);
+			}
+
+			saving[at]+=spn->preload+spn->writeback;
+		}
+
+		vector<u32> order;
+
+		for (u32 i=0;i<regs.size();i++)
+			order.push_back(i);
+
+		std::stable_sort(order.begin(),order.end(),[&saving](u32 a,u32 b)
+		{
+			return saving[a]>saving[b];
 		});
 
-		for (u32 sid=0;sid<order.size();sid++)
+		for (u32 oi=0;oi<order.size();oi++)
 		{
-			RegSpan* spn=order[sid];
+			u32 reg=regs[order[oi]];
 
-			if (spn->start==0 && spn->end==last)
-				continue;
+			vector<RegSpan*> grp;
 
-			bool only=true;
-
-			for (u32 o=0;o<all_spans.size();o++)
+			for (u32 sid=0;sid<all_spans.size();sid++)
 			{
-				if (all_spans[o]!=spn && all_spans[o]->regstart==spn->regstart)
-					only=false;
+				if (all_spans[sid]->regstart==reg)
+					grp.push_back(all_spans[sid]);
 			}
 
-			if (!only || RegTouchedOutside(block,spn))
+			if (grp.empty())
 				continue;
 
-			u32 ostart=spn->start,oend=spn->end;
+			if (grp.size()==1 && grp[0]->start==0 && grp[0]->end==last)
+				continue;
 
-			spn->start=0;
-			spn->end=last;
+			if (RegTouchedOutsideSpans(block,reg))
+				continue;
 
-			if (PeakLive(block,spn->fpr)>(spn->fpr?max_f:max_g))
+			if (PeakLiveHeld(block,grp[0]->fpr,reg)>(grp[0]->fpr?max_f:max_g))
+				continue;
+
+			//join them: the accesses of all of them, over the whole block
+			std::stable_sort(grp.begin(),grp.end(),[](RegSpan* a,RegSpan* b)
 			{
-				spn->start=ostart;
-				spn->end=oend;
-				continue;
+				return a->start<b->start;
+			});
+
+			RegSpan* keep=grp[0];
+
+			for (u32 i=1;i<grp.size();i++)
+			{
+				keep->accesses.insert(keep->accesses.end(),
+					grp[i]->accesses.begin(),grp[i]->accesses.end());
+
+				for (u32 sid=0;sid<all_spans.size();sid++)
+				{
+					if (all_spans[sid]==grp[i])
+					{
+						all_spans.erase(all_spans.begin()+sid);
+						break;
+					}
+				}
+
+				delete grp[i];
 			}
 
-			spn->preload=spn->NeedsPL();
-			spn->writeback=spn->NeedsWB();
+			std::stable_sort(keep->accesses.begin(),keep->accesses.end(),
+				[](const RegAccess& a,const RegAccess& b){ return a.pos<b.pos; });
+
+			keep->start=0;
+			keep->end=last;
+			keep->aliased=false;
+			keep->preload=keep->NeedsPL();
+			keep->writeback=keep->NeedsWB();
 		}
 	}
 
