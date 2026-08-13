@@ -512,10 +512,10 @@ struct RegAlloc
 			{
 				nregf_t want=(nregf_t)(base+k);
 
-				if (find(avoid.begin(),avoid.end(),want)!=avoid.end())
+				if (std::find(avoid.begin(),avoid.end(),want)!=avoid.end())
 					break;
 
-				if (find(regsf.begin(),regsf.end(),want)==regsf.end())
+				if (std::find(regsf.begin(),regsf.end(),want)==regsf.end())
 					break;
 
 				have++;
@@ -527,7 +527,7 @@ struct RegAlloc
 			for (u32 k=0;k<n;k++)
 			{
 				out[k]=(nregf_t)(base+k);
-				regsf.erase(find(regsf.begin(),regsf.end(),out[k]));
+				regsf.erase(std::find(regsf.begin(),regsf.end(),out[k]));
 			}
 
 			return true;

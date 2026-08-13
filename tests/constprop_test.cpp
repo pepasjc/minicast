@@ -107,11 +107,19 @@ static void check_arm32_forms(const vector<shil_opcode>& ops)
 			verify(size == 2 || size == 4);
 		}
 
-		// paired f32 loads: only the nvmem reg-base 32F form supports rd2
+		// paired float loads: only the nvmem reg-base 32F/64F forms support rd2
 		if (o.op == shop_readm && !o.rd2.is_null())
 		{
-			verify(o.rd.is_r32f() && o.rd2.is_r32f());
-			verify((o.flags & 0x7F) == 4);
+			u32 size = o.flags & 0x7F;
+
+			if (size == 8)
+				verify(o.rd.is_r64f() && o.rd2.is_r64f() && o.rd._reg != o.rd2._reg);
+			else
+			{
+				verify(o.rd.is_r32f() && o.rd2.is_r32f());
+				verify(size == 4);
+			}
+
 			verify(o.rs1.is_r32i());
 			verify(o.rs3.is_null());
 		}
@@ -1150,6 +1158,46 @@ static void t_readm_pair_fusion()
 	check_arm32_forms(b3.oplist);
 	for (auto& o : b3.oplist)
 		verify(!(o.op == shop_readm) || o.rd2.is_null());
+
+	// fmov.d @Rn+ x2 (a matrix/vertex fetch) fuses the same way, on +8
+	mock_reset();
+	RuntimeBlockInfo b4 = mkblk();
+	static const Sh4RegType drs[] = {reg_fr_0, reg_fr_2, reg_fr_4};
+	for (auto dr : drs)
+	{
+		b4.oplist.push_back(OP(shop_readm, D(dr), R(reg_r8), P(), 8));
+		b4.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	}
+	fuse_readm_pairs(&b4);
+	check_arm32_forms(b4.oplist);
+
+	verify(count_op(b4.oplist, shop_readm) == 2);
+	verify(b4.oplist[0].rd._reg == reg_fr_0 && b4.oplist[0].rd2._reg == reg_fr_2);
+	verify(b4.oplist[1].op == shop_add && b4.oplist[1].rs2._imm == 16);
+	verify(b4.oplist[2].op == shop_readm && b4.oplist[2].rd2.is_null());
+
+	// guards: a +4 between doubles, and a pair of different sizes
+	mock_reset();
+	RuntimeBlockInfo b5 = mkblk();
+	b5.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	b5.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(4)));   // not +8
+	b5.oplist.push_back(OP(shop_readm, D(reg_fr_2), R(reg_r8), P(), 8));
+	b5.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	b5.oplist.push_back(OP(shop_readm, F(reg_fr_4), R(reg_r8), P(), 4)); // size mismatch
+	fuse_readm_pairs(&b5);
+	check_arm32_forms(b5.oplist);
+	for (auto& o : b5.oplist)
+		verify(!(o.op == shop_readm) || o.rd2.is_null());
+
+	// the same double twice is left alone
+	mock_reset();
+	RuntimeBlockInfo b6 = mkblk();
+	b6.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	b6.oplist.push_back(OP(shop_add, R(reg_r8), R(reg_r8), I(8)));
+	b6.oplist.push_back(OP(shop_readm, D(reg_fr_0), R(reg_r8), P(), 8));
+	fuse_readm_pairs(&b6);
+	check_arm32_forms(b6.oplist);
+	verify(count_op(b6.oplist, shop_readm) == 2);
 }
 
 static void t_imm_literal_bake()

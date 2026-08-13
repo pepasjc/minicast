@@ -345,7 +345,7 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 	void OpBegin(shil_opcode* op,int opid)
 	{
 		batching=true;
-		RegAlloc::OpBegin(op,opid);
+		RegAlloc<eReg,eFSReg,false>::OpBegin(op,opid);
 		batching=false;
 
 		//the flushes first: the op body reads those operands from the context
@@ -356,7 +356,7 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 	void OpEnd(shil_opcode* op)
 	{
 		batching=true;
-		RegAlloc::OpEnd(op);
+		RegAlloc<eReg,eFSReg,false>::OpEnd(op);
 		batching=false;
 
 		EmitMoves(pend_st,true);
@@ -1174,17 +1174,25 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 					{
-						//loads straight into the mapped pair when there is one,
-						//otherwise stages in d64; either way this vldr is the
-						//op ngen_Rewrite patches
-						eFDReg pair=param_dreg(op->rd);
-						eFDReg d64=pair!=(eFDReg)-1?pair:(fpu_temps_avail?d14:d0);
-
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
-						VLDR(d64,r1,0);
 
-						if (pair==(eFDReg)-1)
-							d64_to_param(d64,op->rd);
+						//paired form (fuse_readm_pairs): rd2 = [addr+8], one
+						//address computation for both doubles
+						const shil_param* dst[2]={&op->rd,&op->rd2};
+
+						for (int k=0;k<2 && dst[k]->is_r64f();k++)
+						{
+							//loads straight into the mapped pair when there is
+							//one, otherwise stages in d64; either way the vldr
+							//is the op ngen_Rewrite patches
+							eFDReg pair=param_dreg(*dst[k]);
+							eFDReg d64=pair!=(eFDReg)-1?pair:(fpu_temps_avail?d14:d0);
+
+							VLDR(d64,r1,k*2);
+
+							if (pair==(eFDReg)-1)
+								d64_to_param(d64,*dst[k]);
+						}
 						break;
 					}
 					}
@@ -1210,6 +1218,9 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 					{
+						//pairs are only fused on the nvmem fastpath
+						verify(op->rd2.is_null());
+
 						eFDReg pair=param_dreg(op->rd);
 
 						vmem_slowpath(raddr, r0, f0, pair!=(eFDReg)-1?pair:d64, optp, true);

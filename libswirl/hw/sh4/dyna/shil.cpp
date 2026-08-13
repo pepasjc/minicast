@@ -1021,18 +1021,18 @@ void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
 }
 
 //-----------------------------------------------------------------------------
-// fmov.s @Rn+ pair fusion
+// fmov.s / fmov.d @Rn+ pair fusion
 //
 // The decoder spells a two-float fetch as
 //     readm frA, [rn] (f32);  add rn, rn, #4;  readm frB, [rn] (f32)
 // Fuse it into one readm with rd2 set -- the backend reads [addr] into rd and
-// [addr+4] into rd2 off a single address computation -- followed by the add.
-// When the second load had its own +4 the two adds become adjacent and are
-// combined.
+// [addr+size] into rd2 off a single address computation -- followed by the add.
+// When the second load had its own increment the two adds become adjacent and
+// are combined. Doubles (fmov.d, +8) fuse the same way.
 //
 // Only the nvmem fastpath emits the paired form, and a paired load that
 // faults (mmio) cannot be rewritten into handler calls, so this never runs
-// without nvmem; fmov.s from mmio does not happen in practice.
+// without nvmem; float loads from mmio do not happen in practice.
 //-----------------------------------------------------------------------------
 void fuse_readm_pairs(RuntimeBlockInfo* blk)
 {
@@ -1047,23 +1047,43 @@ void fuse_readm_pairs(RuntimeBlockInfo* blk)
 
 		if (r1.op!=shop_readm || ad.op!=shop_add || r2.op!=shop_readm)
 			continue;
-		if ((r1.flags&0x7F)!=4 || (r2.flags&0x7F)!=4)
+
+		u32 sz=r1.flags&0x7F;
+
+		if ((sz!=4 && sz!=8) || (r2.flags&0x7F)!=sz)
 			continue;
-		if (!r1.rd.is_r32f() || !r1.rd2.is_null() || !r2.rd.is_r32f() || !r2.rd2.is_null())
+
+		bool f64=sz==8;
+
+		if (f64)
+		{
+			if (!r1.rd.is_r64f() || !r2.rd.is_r64f())
+				continue;
+			//a pair that loads the same regs twice is not worth the bother
+			if (r1.rd._reg==r2.rd._reg)
+				continue;
+		}
+		else
+		{
+			if (!r1.rd.is_r32f() || !r2.rd.is_r32f())
+				continue;
+		}
+
+		if (!r1.rd2.is_null() || !r2.rd2.is_null())
 			continue;
 		if (!r1.rs1.is_r32i() || !r1.rs3.is_null() || !r2.rs3.is_null())
 			continue;
 		if (!r2.rs1.is_r32i() || r2.rs1._reg!=r1.rs1._reg)
 			continue;
-		//the middle op must be exactly rn += 4
+		//the middle op must be exactly rn += size
 		if (!(ad.rd.is_r32i() && ad.rd._reg==r1.rs1._reg &&
 		      ad.rs1.is_r32i() && ad.rs1._reg==r1.rs1._reg &&
-		      ad.rs2.is_imm() && ad.rs2._imm==4))
+		      ad.rs2.is_imm() && ad.rs2._imm==sz))
 			continue;
 
 		if (constprop_verbose)
-			printf("fusem %08X+%X: readm pair f%d,f%d @ r%d\n",blk->addr,r1.guest_offs,
-				r1.rd._reg-reg_fr_0,r2.rd._reg-reg_fr_0,r1.rs1._reg);
+			printf("fusem %08X+%X: readm %s pair f%d,f%d @ r%d\n",blk->addr,r1.guest_offs,
+				f64?"f64":"f32",r1.rd._reg-reg_fr_0,r2.rd._reg-reg_fr_0,r1.rs1._reg);
 
 		r1.rd2=r2.rd;
 		blk->oplist.erase(blk->oplist.begin()+i+2);

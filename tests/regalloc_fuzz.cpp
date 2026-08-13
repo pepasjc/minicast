@@ -166,6 +166,16 @@ static void gen_block(RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 			op.op = shop_readm;
 			op.rd = mkvec(rnd_fpr_pair(), FMT_F64);
 			op.rs1 = mkreg(gpr_pool[rnd_below(8)], false);
+
+			// fused form (fuse_readm_pairs): a second double off the same address
+			if (nfpr >= 4 && rnd_below(2) == 0)
+			{
+				Sh4RegType d2 = rnd_fpr_pair();
+
+				if (d2 != op.rd._reg)
+					op.rd2 = mkvec(d2, FMT_F64);
+			}
+
 			blk->oplist.push_back(op);
 			continue;
 		}
