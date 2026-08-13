@@ -1030,9 +1030,10 @@ void constprop(RuntimeBlockInfo* blk, bool allow_memory_baking=true)
 // When the second load had its own increment the two adds become adjacent and
 // are combined. Doubles (fmov.d, +8) fuse the same way.
 //
-// Only the nvmem fastpath emits the paired form, and a paired load that
-// faults (mmio) cannot be rewritten into handler calls, so this never runs
-// without nvmem; float loads from mmio do not happen in practice.
+// Only the nvmem fastpath emits the paired form, so this never runs without
+// nvmem. A paired load that faults is still rewritable: the backend keeps the
+// two loads adjacent, and ngen_Rewrite moves the second one out to a fixup,
+// because the handler call it installs clobbers the base they share.
 //-----------------------------------------------------------------------------
 void fuse_readm_pairs(RuntimeBlockInfo* blk)
 {

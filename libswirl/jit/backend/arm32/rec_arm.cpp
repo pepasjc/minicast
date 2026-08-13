@@ -1174,24 +1174,55 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 
 					case SZ_64F:
 					{
+						eFDReg pair=param_dreg(op->rd);
+						eFDReg pair2=op->rd2.is_r64f()?param_dreg(op->rd2):(eFDReg)-1;
+
+						//Paired form (fuse_readm_pairs): rd2 = [addr+8] off the
+						//same address computation. The two vldrs have to stay
+						//adjacent -- that shape is what ngen_Rewrite looks for
+						//when it has to move the second one off a base its
+						//handler call clobbered -- so there is no room for
+						//staging vmovs between them, and the shared form is
+						//only used when both doubles got a register pair.
+						bool fused=pair!=(eFDReg)-1 && pair2!=(eFDReg)-1;
+
 						ADD(r1,r1,r8);	//3 opcodes, there's no [REG+REG] VLDR
 
-						//paired form (fuse_readm_pairs): rd2 = [addr+8], one
-						//address computation for both doubles
-						const shil_param* dst[2]={&op->rd,&op->rd2};
-
-						for (int k=0;k<2 && dst[k]->is_r64f();k++)
+						if (fused)
 						{
-							//loads straight into the mapped pair when there is
-							//one, otherwise stages in d64; either way the vldr
-							//is the op ngen_Rewrite patches
-							eFDReg pair=param_dreg(*dst[k]);
-							eFDReg d64=pair!=(eFDReg)-1?pair:(fpu_temps_avail?d14:d0);
+							VLDR(pair,r1,0);
+							VLDR(pair2,r1,2);
+							break;
+						}
 
-							VLDR(d64,r1,k*2);
+						//loads straight into the mapped pair when there is one,
+						//otherwise stages in d64; either way this vldr is the
+						//op ngen_Rewrite patches
+						eFDReg d64=pair!=(eFDReg)-1?pair:(fpu_temps_avail?d14:d0);
 
-							if (pair==(eFDReg)-1)
-								d64_to_param(d64,*dst[k]);
+						VLDR(d64,r1,0);
+
+						if (pair==(eFDReg)-1)
+							d64_to_param(d64,op->rd);
+
+						//the second double gets an address computation of its
+						//own then. It has to start from addr+8 in a register:
+						//a rewrite reads the guest address out of whatever the
+						//masking op sources, and rs3 is null on a fused op, so
+						//raddr is one of the callee-saved pool regs and still
+						//holds the base even if the load above became a call.
+						if (op->rd2.is_r64f())
+						{
+							ADD(r0,raddr,8);
+							BIC(r1,r0,0xE0000000);
+							ADD(r1,r1,r8);
+
+							eFDReg d64b=pair2!=(eFDReg)-1?pair2:(fpu_temps_avail?d14:d0);
+
+							VLDR(d64b,r1,0);
+
+							if (pair2==(eFDReg)-1)
+								d64_to_param(d64b,op->rd2);
 						}
 						break;
 					}
@@ -2523,6 +2554,67 @@ struct Arm32NGenBackend: NGenBackend
 	}
 
 	
+	//A fused float load pair (fuse_readm_pairs) shares one address computation:
+	//   bic r1,raddr,#e0000000 / add r1,r1,r8 / vldr a,[r1] / vldr b,[r1,#size]
+	//Is this instruction the [r1,#size] half of such a pair?
+	static bool is_pair_second(const arm_mem_op* op, mem_op_type optp)
+	{
+		const u32 key=optp==SZ_64F?0x0D100B00u:0x0D100A00u;
+
+		//same size, base r1, positive immediate of exactly one element
+		return (op->full&0x0F300F00)==key && op->Rn==1 &&
+			(op->full&(1<<23))!=0 && (op->full&0xFF)==memop_bytes(optp)/4;
+	}
+
+	//...and is it the [r1] half, with its sibling right behind it?
+	static bool is_pair_first(const arm_mem_op* op, mem_op_type optp)
+	{
+		const u32 key=optp==SZ_64F?0x0D100B00u:0x0D100A00u;
+
+		return (op->full&0x0F300F00)==key && op->Rn==1 && (op->full&0xFF)==0 &&
+			is_pair_second(op+1,optp);
+	}
+
+	//The handler call clobbers r1, so the sibling load cannot stay where it is.
+	//It moves to a fixup at the end of the code cache, which recomputes the
+	//address from raddr (callee saved, and the fusion pass keeps the guest's
+	//post-increment after the pair, so it still holds the base) and calls the
+	//handler too. Its slot in the block becomes a branch here.
+	static void RewritePairSecond(arm_mem_op* sibling, eReg raddr, mem_op_type optp)
+	{
+		eFSReg ft=(eFSReg)(sibling->Rt*2 + sibling->D);
+		eFDReg fd=(eFDReg)(sibling->D*16 + sibling->Rt);
+		u32 back=(u32)(sibling+1);
+
+		verify(emit_ptr==0);
+		verify(emit_FreeSpace()>64);
+
+		u32 fixup=(u32)EMIT_GET_PTR();
+
+		ADD(r0,raddr,(s32)memop_bytes(optp));
+		CALL(_mem_func[1][optp]);
+
+		if (optp==SZ_32F)
+			VMOV(ft,r0);
+		else
+			VMOV(fd,r0,r1);
+
+		JUMP(back);
+
+		CacheFlush((void*)fixup,EMIT_GET_PTR());
+
+		//the branch has to fit the one slot the sibling occupies
+		snat lit=(snat)fixup-((snat)sibling+8);
+		verify(lit>=-33554432 && lit<=33554428);
+
+		emit_ptr=(u32*)sibling;
+		JUMP(fixup);
+		verify(emit_ptr==(u32*)(sibling+1));
+		emit_ptr=0;
+
+		CacheFlush((void*)sibling,(void*)(sibling+1));
+	}
+
 	bool Rewrite(rei_host_context_t* ctx)
 	{
 		arm_mem_op* ptr=(arm_mem_op*)ctx->pc;
@@ -2552,6 +2644,35 @@ struct Arm32NGenBackend: NGenBackend
 			die("can't decode opcode\n");
 		}
 
+		//the second half of a fused pair has no address setup of its own: the
+		//first half keeps its fastpath, this one moves to a fixup
+		if (read && (optp==SZ_32F || optp==SZ_64F) && is_pair_second(ptr,optp) &&
+			is_pair_first(ptr-1,optp))
+		{
+			arm_mem_op* setup=ptr-1-offs;
+			eReg raddr;
+
+			if ((setup[0].full & 0x0FE00070)==0x07E00050)
+				raddr=(eReg)(setup[0].Ra);
+			else if ((setup[0].full & 0x0FE00000)==0x03C00000)
+				raddr=(eReg)(setup[0].Rn);
+			else
+			{
+				printf("fail raddr (pair) %08X:(\n",setup[0].full);
+				die("Invalid opcode: vmem fixup\n");
+			}
+
+			RewritePairSecond(ptr,raddr,optp);
+
+			//re-run the slot, it is a branch to the fixup now
+			return true;
+		}
+
+		//a fused pair's first half: rewriting it clobbers the shared base, so
+		//the sibling has to be moved out of the way as well (below)
+		arm_mem_op* pair_sibling=read && (optp==SZ_32F || optp==SZ_64F) &&
+			is_pair_first(ptr,optp) ? ptr+1 : 0;
+
 		ptr -= offs;
 
 		eReg raddr,rt;
@@ -2572,8 +2693,6 @@ struct Arm32NGenBackend: NGenBackend
 		else
 		{
 			printf("fail raddr %08X {@%08X}:(\n",ptr[0].full,regs[1]);
-			//if this hits with a VLDR.32 whose imm is 1, a paired f32 readm
-			//(fuse_readm_pairs) faulted -- mmio pairs can't be rewritten
 			die("Invalid opcode: vmem fixup\n");
 		}
 		//from mem op
@@ -2683,7 +2802,15 @@ struct Arm32NGenBackend: NGenBackend
 
 
 		CacheFlush((void*)ptr, (void*)emit_ptr);
+
+		//the call above just clobbered the base the sibling load reads through
+		if (pair_sibling)
+			verify(emit_ptr==(u32*)pair_sibling);
+
 		emit_ptr=0;
+
+		if (pair_sibling)
+			RewritePairSecond(pair_sibling,raddr,optp);
 
 		ctx->pc = (unat)ptr;
 
