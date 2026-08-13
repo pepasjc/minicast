@@ -480,6 +480,7 @@ struct settings_t
 		int opt_constprop;		// 0 = 0ff, 1 = safe, 2 = include page constant
 		bool opt_readm_pairs; 	// fuse +0 and +4 addresses on same base reg
 		bool opt_fipr_w;		// simplify fipr if w is provably 0 or 1
+		bool opt_self_loops;	// keep regs live across a block's branch to itself
 
 		SmcCheckEnum SmcCheckLevel;
 		int ScpuEnable;

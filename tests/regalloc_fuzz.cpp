@@ -275,6 +275,7 @@ static void dump_block(RuntimeBlockInfo* blk)
 }
 
 static u64 g_elided, g_movs, g_spills, g_fail_ctx, g_vecops, g_vecruns;
+static u64 g_loops, g_carried_wb, g_carried_pl;
 static RuntimeBlockInfo* g_cur_blk;
 static u64 g_cur_seed;
 static TestAlloc* g_cur_alloc;
@@ -298,6 +299,47 @@ static void dump_spans(TestAlloc* a)
 	dump_spans(g_cur_alloc); \
 	exit(1); } } while (0)
 
+// mirrors the arm32 gate (block_self_loops): the preamble is skipped on the
+// back edge, so nothing may hand a register over through the context there
+static bool can_loop(RuntimeBlockInfo* blk, TestAlloc* alloc)
+{
+	if (blk->oplist.empty())
+		return false;
+
+	shil_opcode* op = &blk->oplist[0];
+	shil_param* rd[3] = { &op->rs1, &op->rs2, &op->rs3 };
+	shil_param* all[5] = { &op->rd, &op->rd2, &op->rs1, &op->rs2, &op->rs3 };
+
+	// a vector operand at op 0 only rules the block out if one of its registers
+	// can also hold a span there -- see block_self_loops
+	for (int p = 0; p < 3; p++)
+	{
+		if (!rd[p]->is_reg() || rd[p]->count() <= 1 || alloc->ExplodeVec(op, *rd[p]))
+			continue;
+
+		for (u32 e = 0; e < rd[p]->count(); e++)
+		{
+			u32 r = (u32)rd[p]->_reg + e;
+
+			for (int q = 0; q < 5; q++)
+			{
+				shil_param* o = all[q];
+
+				if (o == rd[p] || !o->is_reg())
+					continue;
+
+				if (o->count() != 1 && !alloc->ExplodeVec(op, *o))
+					continue;
+
+				if (r >= (u32)o->_reg && r < (u32)o->_reg + o->count())
+					return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfpr)
 {
 	int gprs[17], fprs[17];
@@ -307,7 +349,32 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	fprs[nfpr] = -1;
 
 	g_cur_alloc = alloc;
+
+	// a block that branches back to its own start: run it several times with
+	// the loop path in between (no end writebacks, no entry preloads)
+	bool loops = can_loop(blk, alloc) && rnd_below(3) == 0;
+	u32 iters = loops ? 2 + rnd_below(3) : 1;
+
+	alloc->block_loops = loops;
 	alloc->DoAlloc(blk, gprs, fprs);
+
+	// context traffic the back edge skips, per iteration
+	if (loops)
+	{
+		g_loops++;
+		for (size_t s = 0; s < alloc->all_spans.size(); s++)
+		{
+			TestAlloc::RegSpan* spn = alloc->all_spans[s];
+
+			if (alloc->CarriedNeedsFlush(spn))
+				continue;
+
+			if (spn->writeback && spn->end + 1 == blk->oplist.size())
+				g_carried_wb++;
+			if (spn->preload && spn->start == 0)
+				g_carried_pl++;
+		}
+	}
 	g_spills += alloc->spills;
 	alloc->spills = 0;
 
@@ -342,11 +409,27 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 	for (int i = 0; i < sh4_reg_count; i++)
 		arch[i] = alloc->ctx[i] = next_val++;
 
+	for (u32 iter = 0; iter < iters; iter++)
+	{
+	// the hardware runs one emitted copy of the block, so every iteration has
+	// to see the state this pass had at the top of the first one
+	for (size_t s = 0; s < alloc->all_spans.size(); s++)
+		alloc->all_spans[s]->dirty = false;
+
 	for (size_t opid = 0; opid < blk->oplist.size(); opid++)
 	{
 		shil_opcode* op = &blk->oplist[opid];
 
-		alloc->OpBegin(op, (int)opid);
+		// only the carried half of op 0's preloads sits above the loop header
+		if (opid == 0 && loops)
+		{
+			if (iter == 0)
+				alloc->OpBeginCarried(op, 0);
+
+			alloc->OpBeginTransient(op, 0);
+		}
+		else
+			alloc->OpBegin(op, (int)opid);
 
 		// read all mapped sources first (the backend contract)
 		shil_param* srcs[] = { &op->rs1, &op->rs2, &op->rs3 };
@@ -451,7 +534,13 @@ static void run_block(TestAlloc* alloc, RuntimeBlockInfo* blk, u32 ngpr, u32 nfp
 			}
 		}
 
-		alloc->OpEnd(op);
+		// on the back edge the values stay in their registers, except the ones
+		// the next iteration would read back out of the context
+		if (opid + 1 == blk->oplist.size() && iter + 1 < iters)
+			alloc->OpEndLoop(op);
+		else
+			alloc->OpEnd(op);
+	}
 	}
 
 	for (int i = 0; i < sh4_reg_count; i++)
@@ -472,6 +561,7 @@ int main(int argc, char** argv)
 	for (int reuse = 0; reuse <= 1; reuse++)
 	{
 		g_elided = g_movs = g_spills = g_vecops = g_vecruns = 0;
+		g_loops = g_carried_wb = g_carried_pl = 0;
 		for (u32 pi = 0; pi < npools; pi++)
 		{
 			TestAlloc alloc;
@@ -494,6 +584,9 @@ int main(int argc, char** argv)
 			alias, reuse, (unsigned long long)g_movs, (unsigned long long)g_elided,
 			(unsigned long long)g_spills, (unsigned long long)g_vecops,
 			(unsigned long long)g_vecruns);
+		printf("            %llu looping blocks: %llu writebacks + %llu preloads carried per iteration\n",
+			(unsigned long long)g_loops, (unsigned long long)g_carried_wb,
+			(unsigned long long)g_carried_pl);
 	}
 
 	printf("all passed\n");

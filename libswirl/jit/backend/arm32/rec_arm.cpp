@@ -348,6 +348,29 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 		RegAlloc<eReg,eFSReg,false>::OpBegin(op,opid);
 		batching=false;
 
+		FlushOpBegin();
+	}
+
+	void OpBeginCarried(shil_opcode* op,int opid)
+	{
+		batching=true;
+		RegAlloc<eReg,eFSReg,false>::OpBeginCarried(op,opid);
+		batching=false;
+
+		FlushOpBegin();
+	}
+
+	void OpBeginTransient(shil_opcode* op,int opid)
+	{
+		batching=true;
+		RegAlloc<eReg,eFSReg,false>::OpBeginTransient(op,opid);
+		batching=false;
+
+		FlushOpBegin();
+	}
+
+	void FlushOpBegin()
+	{
 		//the flushes first: the op body reads those operands from the context
 		EmitMoves(pend_st,true);
 		EmitMoves(pend_ld,false);
@@ -357,6 +380,24 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 	{
 		batching=true;
 		RegAlloc<eReg,eFSReg,false>::OpEnd(op);
+		batching=false;
+
+		EmitMoves(pend_st,true);
+	}
+
+	void FlushCarried(int opid)
+	{
+		batching=true;
+		RegAlloc<eReg,eFSReg,false>::FlushCarried(opid);
+		batching=false;
+
+		EmitMoves(pend_st,true);
+	}
+
+	void FlushLive(int opid)
+	{
+		batching=true;
+		RegAlloc<eReg,eFSReg,false>::FlushLive(opid);
 		batching=false;
 
 		EmitMoves(pend_st,true);
@@ -471,6 +512,144 @@ static void JUMP_or_fallthrough(u32 target)
 		NOP();
 	else
 		JUMP(target);
+}
+
+//A block whose taken edge is its own start is a loop. Everything the ops need
+//can stay in host registers across the back edge, so the loop path skips both
+//the end writebacks and the entry preloads -- see emit_self_loop_tail.
+//
+//Gated on the block never moving the register file through the context behind
+//a span's back: interpreter fallbacks and the sync ops do that wholesale, and
+//a vector operand at op 0 would need its commit inside the skipped preamble.
+static bool block_self_loops(RuntimeBlockInfo* block)
+{
+	if (!settings.dynarec.opt_self_loops || block->oplist.empty())
+		return false;
+
+	if (block->BlockType!=BET_Cond_0 && block->BlockType!=BET_Cond_1)
+		return false;
+
+	if (block->BranchBlock!=block->addr)
+		return false;
+
+	for (size_t i=0;i<block->oplist.size();i++)
+	{
+		shil_opcode* op=&block->oplist[i];
+
+		if (op->op==shop_ifb || op->op==shop_sync_sr || op->op==shop_sync_fpscr)
+			return false;
+
+		if (i!=0)
+			continue;
+
+		//A vector operand reads its registers from the context, so a span
+		//holding one of them commits it first -- and at op 0 that commit lands
+		//in the preamble, which later iterations skip. Nothing precedes op 0,
+		//so a span can only exist there if this same op names the register
+		//somewhere it can be allocated: that is what rules the block out, not
+		//the vector operand by itself (an ftrv reading an unallocated xmtrx is
+		//fine, and that is what a loop full of them looks like).
+		const shil_param* rd[3]={&op->rs1,&op->rs2,&op->rs3};
+		const shil_param* all[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+		for (int p=0;p<3;p++)
+		{
+			if (!rd[p]->is_reg() || rd[p]->count()<=1 || reg.ExplodeVec(op,*rd[p]))
+				continue;
+
+			for (u32 e=0;e<rd[p]->count();e++)
+			{
+				u32 ra=(u32)rd[p]->_reg+e;
+
+				for (int q=0;q<5;q++)
+				{
+					const shil_param* o=all[q];
+
+					if (o==rd[p] || !o->is_reg())
+						continue;
+
+					if (o->count()!=1 && !reg.ExplodeVec(op,*o))
+						continue;	//not allocatable either, no span
+
+					if (ra>=(u32)o->_reg && ra<(u32)o->_reg+o->count())
+						return false;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+
+//The condition under which the block takes its branch -- for a self loop, the
+//condition to go around again. Mirrors DynaRBI::Relink's selection, except
+//sr_T may still be in a host register here: the writebacks come after.
+static ConditionCode self_loop_cc(RuntimeBlockInfo* block)
+{
+	shil_opcode* last=&block->oplist[block->oplist.size()-1];
+
+	if (!block->has_jcond && last->rd._reg==reg_sr_T && ccmap.count(last->op))
+		return (block->BlockType&1)==1?ccmap[last->op]:ccnmap[last->op];
+
+	if (block->has_jcond)
+		CMP(r4,(block->BlockType&1));
+	else if (reg.IsAllocg(reg_sr_T))
+		CMP(reg.mapg(reg_sr_T),(block->BlockType&1));
+	else
+	{
+		LoadSh4Reg_mem(r0,reg_sr_T);
+		CMP(r0,(block->BlockType&1));
+	}
+
+	return CC_EQ;
+}
+
+//Emitted after the last op's body, before its writebacks:
+//
+//    <condition>
+//    b   exit, !cc          ; leaving the loop: the writebacks and the relink
+//    <commit what cannot be carried>
+//    subs r9, r9, #cycles   ; one poll per iteration, like a block entry
+//    bgt loop_header        ; the whole point: no writebacks, no preloads
+//    <commit everything live>
+//    bl  intc_sched         ; may not return -- it takes the interrupt at this
+//    b   loop_header        ; block's start pc, which is where the loop is
+//  exit:
+//
+//The context only has to be whole where the block can be abandoned, so the
+//commits sit on the two cold paths. Doing this at the back edge rather than at
+//loop_header is what makes them safe: by here every span has been written at
+//least once, while at the top of the first iteration a write-first span still
+//holds whatever the last block left in the register.
+static void emit_self_loop_tail(RuntimeBlockInfo* block, u32 loop_header, u32 cyc)
+{
+	int last=(int)block->oplist.size()-1;
+
+	ConditionCode cc=self_loop_cc(block);
+
+	u32* exit_slot=(u32*)EMIT_GET_PTR();
+	NOP();	//the exit branch, once its target is known
+
+	reg.FlushCarried(last);
+
+#if HOST_OS == OS_DARWIN
+	SUB(r11,r11,cyc,true,CC_AL);
+#else
+	SUB(rfp_r9,rfp_r9,cyc,true,CC_AL);
+#endif
+	JUMP(loop_header,CC_GT);
+
+	reg.FlushLive(last);
+	CALL((u32)intc_sched);
+	JUMP(loop_header);
+
+	u32 exit=(u32)EMIT_GET_PTR();
+
+	verify(emit_ptr==0);
+	emit_ptr=exit_slot;
+	JUMP(exit,(ConditionCode)(cc^1));
+	verify(emit_ptr==exit_slot+1);
+	emit_ptr=0;
 }
 
 u32 DynaRBI::Relink()
@@ -2353,7 +2532,12 @@ struct Arm32NGenBackend: NGenBackend
 		}
 		xmtrx_resident=false;
 
+		//a staging block is counted down per entry to decide when to recompile
+		//it optimised, so it must keep going around through the dispatcher
+		bool self_loop=!staging && block_self_loops(block);
+
 		//reg alloc
+		reg.block_loops=self_loop;
 		reg.DoAlloc(block,alloc_regs,fpu_temps_avail?alloc_fpu_temps:alloc_fpu);
 
 		u8* blk_start=(u8*)EMIT_GET_PTR();
@@ -2367,7 +2551,10 @@ struct Arm32NGenBackend: NGenBackend
 		}
 		//pre-load the first reg alloc operations, for better efficiency ..
 		block->host_preload0=(u8*)EMIT_GET_PTR()-blk_start;
-		reg.OpBegin(&block->oplist[0],0);
+		if (self_loop)
+			reg.OpBeginCarried(&block->oplist[0],0);	//the rest below the loop header
+		else
+			reg.OpBegin(&block->oplist[0],0);
 		block->host_preload0_end=(u8*)EMIT_GET_PTR()-blk_start;
 
 		//scheduler
@@ -2470,12 +2657,46 @@ struct Arm32NGenBackend: NGenBackend
 		if (cycle_check)
 			CALL((u32)intc_sched, CC_LE);
 
+		//The matrix is another thing a loop need not redo: load it above the
+		//loop header and the ftrv emitters skip their column loads entirely.
+		//Only when nothing in the block can clobber s0-s15 though -- and that
+		//includes every memop, because ngen_Rewrite may turn its fastpath into
+		//a handler call at any time, and the handler owns the caller-saved vfp
+		//bank the matrix lives in.
+		if (self_loop && fpu_temps_avail)
+		{
+			shil_opcode* ftrv=0;
+			bool kills=false;
+
+			for (size_t i=0;i<block->oplist.size();i++)
+			{
+				if (block->oplist[i].op==shop_ftrv && !ftrv)
+					ftrv=&block->oplist[i];
+
+				kills|=op_kills_xmtrx(&block->oplist[i]);
+			}
+
+			if (ftrv && !kills)
+			{
+				SUB(r2,r8,ftrv->rs2.reg_aofs());
+				VLDM(d0,r2,8);
+				xmtrx_resident=true;
+			}
+		}
+
+		//everything above runs once per entry from the outside; the back edge
+		//comes back here with the carried registers still loaded
+		u32 loop_header=(u32)EMIT_GET_PTR();
+
+		if (self_loop)
+			reg.OpBeginTransient(&block->oplist[0],0);
+
 		//compile the block's opcodes
 		shil_opcode* op;
 		for (size_t i=0;i<block->oplist.size();i++)
 		{
 			op=&block->oplist[i];
-			
+
 			op->host_offs=(u8*)EMIT_GET_PTR()-blk_start;
 
 			if (i!=0)
@@ -2489,6 +2710,10 @@ struct Arm32NGenBackend: NGenBackend
 
 			if (xmtrx_resident && op_kills_xmtrx(op))
 				xmtrx_resident=false;
+
+			//the loop path branches off before the writebacks
+			if (self_loop && i+1==block->oplist.size())
+				emit_self_loop_tail(block,loop_header,cyc);
 
 			reg.OpEnd(op);
 		}

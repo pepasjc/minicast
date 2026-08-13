@@ -250,6 +250,7 @@ void InitSettings()
     settings.dynarec.opt_constprop = 1;
     settings.dynarec.opt_readm_pairs = 0;
     settings.dynarec.opt_fipr_w = 1;
+    settings.dynarec.opt_self_loops = 0;
 
     settings.dynarec.ScpuEnable = true;
     settings.dynarec.DspEnable = true;
@@ -316,6 +317,7 @@ void LoadSettings(bool game_specific)
     settings.dynarec.opt_constprop = cfgLoadInt(config_section, "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
     settings.dynarec.opt_readm_pairs = cfgLoadBool(config_section, "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
     settings.dynarec.opt_fipr_w = cfgLoadBool(config_section, "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
+    settings.dynarec.opt_self_loops = cfgLoadBool(config_section, "Dynarec.opt_self_loops", settings.dynarec.opt_self_loops);
 
     settings.dynarec.SmcCheckLevel = (SmcCheckEnum)cfgLoadInt(config_section, "Dynarec.SmcCheckLevel", settings.dynarec.SmcCheckLevel);
     settings.dynarec.ScpuEnable = cfgLoadInt(config_section, "Dynarec.ScpuEnabled", settings.dynarec.ScpuEnable);
@@ -431,6 +433,7 @@ void SaveSettings()
 	cfgSaveInt("config", "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
 	cfgSaveBool("config", "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
 	cfgSaveBool("config", "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
+	cfgSaveBool("config", "Dynarec.opt_self_loops", settings.dynarec.opt_self_loops);
     cfgSaveInt("config", "Dynarec.SmcCheckLevel", (int)settings.dynarec.SmcCheckLevel);
 
     cfgSaveInt("config", "Dreamcast.Language", settings.dreamcast.language);
