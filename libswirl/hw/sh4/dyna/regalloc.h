@@ -819,12 +819,15 @@ struct RegAlloc
 				RegSpan* x=FindSpan(block->oplist[opid].rs1._reg,(u32)opid);
 				RegSpan* d=FindSpan(block->oplist[opid].rd._reg,(u32)opid);
 
-				//src must never be written again (the shared reg holds both
-				//values until one dies), and dst must not be written again
-				//until strictly after src's end: src's writeback runs at OpEnd
-				//of its last op, after that op's body has already stored dst
-				//into the shared reg.
-				if (x!=d && !x->aliased && x->nacc_w((int)opid)==-1)
+				//The shared reg holds both values until one of them dies, so
+				//neither may be written while the other is still live: src not
+				//before dst's end (dst's writeback runs at OpEnd of that op,
+				//and would store src's new value), and dst not until strictly
+				//after src's end (src's writeback runs at OpEnd of its last op,
+				//after that op's body has already stored dst into the reg).
+				int swa=x->nacc_w((int)opid);
+
+				if (x!=d && !x->aliased && (swa==-1 || swa>(int)d->end))
 				{
 					int nwa=d->nacc_w((int)opid);
 
