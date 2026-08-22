@@ -668,7 +668,7 @@ bool MatchDiv32u(u32 op,u32 pc)
 
 bool MatchDiv32s(u32 op,u32 pc)
 {
-	if (settings.dynarec.opt_div1_som)
+	if (!settings.dynarec.opt_div1_som)
 		return false;
 
 	u32 n = GetN(op);
