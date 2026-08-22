@@ -229,6 +229,7 @@ void RuntimeBlockInfo::Setup(u32 rpc,fpscr_t rfpu_cfg)
 
 void UpdateSystem_StartBlockCompile();
 void UpdateSystem_EndBlockCompile();
+u32 rdv_compiles;
 
 DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 {
@@ -253,6 +254,7 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 	}
 
 	UpdateSystem_StartBlockCompile();
+	rdv_compiles++;
 	RuntimeBlockInfo* rv=0;
 	do
 	{

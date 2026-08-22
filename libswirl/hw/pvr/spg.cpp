@@ -68,6 +68,8 @@ void CancelREP() {
     }
 }
 
+extern u32 rdv_compiles;
+
 struct SPG_impl final : SPG {
     ASIC* asic;
 
@@ -276,12 +278,13 @@ struct SPG_impl final : SPG {
                     full_rps = (spd_fps + fskip / ts);
 
                     char temp[2048];
-                    snprintf(temp, 2048, "%s/%c - %4.2f - %4.2f - V: %4.2f (%.2f, %s%s%4.2f) R: %4.2f+%4.2f VTX: %4.2f%c, MIPS: %.2f",
+                    snprintf(temp, 2048, "%s/%c - %4.2f - %4.2f - V: %4.2f (%.2f, %s%s%4.2f) R: %4.2f+%4.2f Compiles: %u",
                         VER_SHORTNAME, 'n', mspdf, spd_cpu * 100 / 200, spd_vbs,
                         spd_vbs / full_rps, mode, res, fullvbs,
-                        spd_fps, fskip / ts
-                        , mv, mv_c, mips_counter / 1024.0 / 1024.0);
+                        spd_fps, fskip / ts,
+                        rdv_compiles);
                     mips_counter = 0;
+                    rdv_compiles = 0;
 
                     os_SetWindowText(temp);
 
