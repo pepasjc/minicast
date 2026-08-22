@@ -100,9 +100,10 @@ bool sq_reg_is_read(RuntimeBlockInfo* blk, Sh4RegType rt)
 	return false;
 }
 
-void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
+bool sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 {
 	u32 data=0;
+	u32 unit=0;
 	for (int c=i-1;c>0;c--)
 	{
 		if (blk->oplist[c].op==shop_writem && blk->oplist[c].rs1._reg==rt)
@@ -110,6 +111,7 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 			if (blk->oplist[c].rs2.is_r32i() ||  blk->oplist[c].rs2.is_r32f() || blk->oplist[c].rs2.is_r64f() || blk->oplist[c].rs2.is_r32fv())
 			{
 				data+=blk->oplist[c].flags;
+				unit=blk->oplist[c].flags;
 				if (mark)
 					blk->oplist[c].flags2=0x1337;
 			}
@@ -117,7 +119,14 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 				break;
 		}
 
-		if (blk->oplist[c].op==shop_pref || (blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt && blk->oplist[c].op!= shop_sub))
+		//add rt <= rt, imm with imm == the store size is the post-increment between
+		//SQ stores (fmov @Rn; add #sz,Rn idiom) - base stays in the line, keep scanning
+		if (blk->oplist[c].op==shop_add && blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt &&
+			blk->oplist[c].rs1.is_reg() && blk->oplist[c].rs1._reg==rt &&
+			blk->oplist[c].rs2.is_imm() && unit!=0 && blk->oplist[c].rs2._imm==unit)
+		{
+		}
+		else if (blk->oplist[c].op==shop_pref || (blk->oplist[c].rd.is_reg() && blk->oplist[c].rd._reg==rt && blk->oplist[c].op!= shop_sub))
 		{
 			break;
 		}
@@ -126,27 +135,48 @@ void sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 			break;
 	}
 
-	if (mark) return;
+	if (mark) return true;
 
 	if (data>=8)
 	{
 		blk->oplist[i].flags =0x1337;
 		sq_pref(blk,i,rt,true);
 		printf("SQW-WM match %d !\n",data);
+		return true;
 	}
 	else if (data)
 	{
 		printf("SQW-WM FAIL %d !\n",data);
+		return false;
 	}
+	return false;
 }
 
 void sq_pref(RuntimeBlockInfo* blk)
 {
+	bool optimized = false;
 	for (int i=0;i<blk->oplist.size();i++)
 	{
 		blk->oplist[i].flags2=0;
-		if (blk->oplist[i].op==shop_pref && !sq_reg_is_read(blk,blk->oplist[i].rs1._reg))
-			sq_pref(blk,i,blk->oplist[i].rs1._reg,false);
+		if (blk->oplist[i].op==shop_pref && !sq_reg_is_read(blk,blk->oplist[i].rs1._reg)) {
+			if (sq_pref(blk,i,blk->oplist[i].rs1._reg,false)) {
+				optimized = true;
+			}
+		}
+	}
+
+	if (optimized) {
+		// auto f = stdout;
+		// fprintf(f,"block: %p\n",blk);
+		// fprintf(f,"addr: %08X\n",blk->addr);
+		// fprintf(f,"il_opcodes: %zd\n",blk->oplist.size());
+
+
+		// for (u32 j=0;j<blk->oplist.size();j++)
+		// {
+		// 	shil_opcode* op=&blk->oplist[j];
+		// 	fprintf(f,"//il:%d:%d:%s\n",op->guest_offs,op->host_offs,op->dissasm().c_str());
+		// }
 	}
 }
 

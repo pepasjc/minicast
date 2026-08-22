@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdint>
 #include <vector>
+#include <string>
 
 using namespace std;
 
@@ -202,6 +203,7 @@ struct shil_opcode
 	u16 guest_offs = 0;
 	u16 host_body = 0;
 	u16 host_body_end = 0;
+	std::string dissasm() { return ""; }
 };
 
 struct RuntimeBlockInfo
