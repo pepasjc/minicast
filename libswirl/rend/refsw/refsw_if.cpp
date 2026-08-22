@@ -146,7 +146,7 @@ void rend_end_render() {
     printf("rend_end_render\n");
 }
 
-bool rend_render_done() {
+bool rend_render_done(u32 GuestRenderCycles) {
     return true; // RenderCORE is synchronous
 }
 

@@ -227,6 +227,9 @@ void RuntimeBlockInfo::Setup(u32 rpc,fpscr_t rfpu_cfg)
 	AnalyseBlock(this);
 }
 
+void UpdateSystem_StartBlockCompile();
+void UpdateSystem_EndBlockCompile();
+
 DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 {
 	u32 pc=next_pc;
@@ -249,6 +252,7 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
 		return nullptr;
 	}
 
+	UpdateSystem_StartBlockCompile();
 	RuntimeBlockInfo* rv=0;
 	do
 	{
@@ -287,6 +291,8 @@ DynarecCodeEntryPtr rdv_CompilePC_OrFail(bool soft_resets)
     #endif
 
 	bm_printf("rdv_CompilePC: end %08X\n", next_pc);
+
+	UpdateSystem_EndBlockCompile();
 
 	return rv->code;
 }

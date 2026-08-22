@@ -51,10 +51,12 @@ u32 fskip = 0;
 extern u32 PVR_VTXC;
 
 static bool hasrep;
+static u32 GuestRenderCycles;
 void SetREP(u32 render_end_pending_cycles)
 {
     verify(hasrep == false);
     hasrep = true;
+    GuestRenderCycles = 0;
     sh4_sched_request(render_end_schid, render_end_pending_cycles);
 }
 
@@ -343,8 +345,15 @@ struct SPG_impl final : SPG {
 
     int rend_end_sch(int tag, int cycl, int jitt)
     {
-        if (settings.freerunning && !rend_render_done())
+        GuestRenderCycles += REND_DONE_POLL_CYCLES;
+        
+        if (settings.freerunning && !rend_render_done(GuestRenderCycles)) {
             return REND_DONE_POLL_CYCLES;
+        }
+        
+        if (settings.pvr.FPSTarget == 0 && !rend_render_done(GuestRenderCycles)) {
+            return REND_DONE_POLL_CYCLES;
+        }
 
         hasrep = false;
         asic->RaiseInterrupt(holly_RENDER_DONE);

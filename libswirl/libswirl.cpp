@@ -267,7 +267,7 @@ void InitSettings()
     
 
     settings.pvr.MultithreadedTA = 0;
-    settings.pvr.FPSTarget = 66;
+    settings.pvr.FPSTarget = 0;
 
     settings.polly2.AutoReset = true;
     settings.polly2.DumpOnLockup = false;
@@ -277,6 +277,7 @@ void InitSettings()
 
     settings.freerunning = false;
 
+    settings.debug.PrintTaErrors = false;
     settings.debug.SerialConsole = false;
     settings.debug.VirtualSerialPort = false;
     settings.debug.VirtualSerialPortFile = "";

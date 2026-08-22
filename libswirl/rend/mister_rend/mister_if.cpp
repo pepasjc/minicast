@@ -62,12 +62,23 @@ static std::atomic<bool> polly_gone;
 extern std::atomic<bool> vram_dump_pending;
 extern void do_vram_dump(u8* vram, u8* pvr_regs);
 
-bool rend_render_done() {
+bool rend_render_done(u32 GuestRenderCycles) {
     if (polly_gone && polly2_done()) {
         return true;
     }
 
     if(polly_gone) {
+
+        if (!settings.freerunning && settings.pvr.FPSTarget == 0) {
+            // u64 scaled = (u64)polly2_frame_cycles() * SH4_MAIN_CLOCK / polly2_clock_hz();
+            // // hold the guest only while it has run ahead of the hardware's progress
+            // while (!polly2_done() && GuestRenderCycles >= scaled)
+            //     scaled = (u64)polly2_frame_cycles() * SH4_MAIN_CLOCK / polly2_clock_hz();
+            if (polly2_done()) {
+                return true;
+            }
+        }
+
         if (now_ns() > poll_deadline_ns) {
             poll_deadline_ns = now_ns() + 500000000ULL;
             printf("polly2: Timeout waiting for Frame Done!\n");
@@ -121,7 +132,7 @@ void rend_start_render(u8* vram) {
 
     // freerunning: REP polls for real completion; FPSTarget pacing only
     // applies when emulated time is decoupled from wall time
-    if (settings.freerunning) {
+    if (settings.freerunning || settings.pvr.FPSTarget == 0) {
         SetREP(REND_DONE_POLL_CYCLES);
     } else {
         SetREP(200000000/settings.pvr.FPSTarget);

@@ -484,12 +484,16 @@ static void ta_end_list() {
 static void ta_bad_input_error() {
     if (settings.pvr.MultithreadedTA != TA_STTA)
     {
-        printf("TA error: holly_ILLEGAL_PARAM. (interrupt suppressed)\n");
+        if (settings.debug.PrintTaErrors) {
+            printf("TA error: holly_ILLEGAL_PARAM. (interrupt suppressed)\n");
+        }
     }
     else
     {
         asic_RaiseInterrupt(holly_ILLEGAL_PARAM);
-        printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
+        if (settings.debug.PrintTaErrors) {
+            printf("TA error: holly_ILLEGAL_PARAM. Interrupt raised\n");
+        }
         //asic_event( EVENT_PVR_BAD_INPUT );
     }
 }
@@ -509,10 +513,14 @@ static int ta_write_polygon_buffer( uint32_t *data, int length )
     for( rv=0; rv < length; rv++ ) {
         if( posn == end ) {
             if (settings.pvr.MultithreadedTA != TA_STTA) {
-                printf("TA error: holly_PRIM_NOMEM. (interrupt suppressed)\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_PRIM_NOMEM. (interrupt suppressed)\n");
+                }
             } else {
                 asic_RaiseInterrupt(holly_PRIM_NOMEM);
-                printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_PRIM_NOMEM. Interrupt Raised\n");
+                }
                 //asic_event( EVENT_PVR_PRIM_ALLOC_FAIL );
             }
             ////	    ta_status.state = STATE_ERROR;
@@ -552,10 +560,14 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
         } else if( newposn <= limit ) {
         } else if( newposn <= (limit + ta_status.current_tile_size) ) {
             if (settings.pvr.MultithreadedTA != TA_STTA) {
-                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+                }
             } else {
                 asic_RaiseInterrupt(holly_MATR_NOMEM);
-                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                }
                 //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
             }
             TA_NEXT_OPB = newposn;
@@ -578,10 +590,14 @@ static uint32_t ta_alloc_tilelist( uint32_t reference ) {
         } else if( newposn >= limit ) {
         } else if( newposn >= (limit - ta_status.current_tile_size) ) {
             if (settings.pvr.MultithreadedTA != TA_STTA) {
-                printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_MATR_NOMEM. (interrupt suppressed)\n");
+                }
             } else {
                 asic_RaiseInterrupt(holly_MATR_NOMEM);
-                printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                if (settings.debug.PrintTaErrors) {
+                    printf("TA error: holly_MATR_NOMEM. Interrupt raised\n");
+                }
                 //asic_event( EVENT_PVR_MATRIX_ALLOC_FAIL );
             }
             TA_NEXT_OPB = newposn;

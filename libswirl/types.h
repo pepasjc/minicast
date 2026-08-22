@@ -546,6 +546,7 @@ struct settings_t
 	bool freerunning;
 
 	struct {
+		bool PrintTaErrors;
 		bool SerialConsole;
 		bool VirtualSerialPort;
 		string VirtualSerialPortFile;

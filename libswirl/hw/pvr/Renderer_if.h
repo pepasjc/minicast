@@ -21,4 +21,4 @@ void rend_end_render();
 // freerunning mode: rend_end_sch polls the renderer for actual completion at
 // 100kHz instead of raising RENDER_DONE at the fixed FPSTarget latency
 #define REND_DONE_POLL_CYCLES (SH4_MAIN_CLOCK / (100 * 1000))
-bool rend_render_done();
+bool rend_render_done(u32 GuestRenderCycles);

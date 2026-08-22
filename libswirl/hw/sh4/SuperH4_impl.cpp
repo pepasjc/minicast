@@ -114,6 +114,15 @@ static bool freerun_init()
 #endif
 }
 
+u64 compile_cycles;
+u32 compile_start;
+void UpdateSystem_StartBlockCompile() {
+    compile_start = freerun_now();
+}
+void UpdateSystem_EndBlockCompile() {
+    compile_cycles += freerun_now() - compile_start;
+}
+
 // every SH4_TIMESLICE cycles
 int UpdateSystem()
 {
@@ -124,6 +133,14 @@ int UpdateSystem()
     if (settings.freerunning)
     {
         u32 elapsed = freerun_now() - freerun_last;
+
+        if (compile_cycles > elapsed) {
+            compile_cycles -= elapsed;
+            return Sh4cntx.interrupt_pend | (sh4_int_bCpuRun == false);
+        } else {
+            elapsed -= compile_cycles;
+            compile_cycles = 0;
+        }
 
         // if buffer is nearly full, don't generate more audio / update timers
         if (polly2_audio_space() < 128) {
