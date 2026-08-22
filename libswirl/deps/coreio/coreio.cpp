@@ -39,16 +39,16 @@ struct CoreFileLocal: CoreFile
 
 	void seek()
 	{
-		fseek(f, seek_ptr, SEEK_SET);
+		fseeko64(f, seek_ptr, SEEK_SET);
 	}
 
 	size_t size()
 	{
-		size_t p = ftell(f);
-		fseek(f, 0, SEEK_END);
+		size_t p = ftello64(f);
+		fseeko64(f, 0, SEEK_END);
 
-		size_t rv = ftell(f);
-		fseek(f, p, SEEK_SET);
+		size_t rv = ftello64(f);
+		fseeko64(f, p, SEEK_SET);
 
 		return rv;
 	}

@@ -7,9 +7,9 @@
 
 typedef struct image_s
        {
-       long               header_offset;
-       long               header_position;
-       long               length;
+       unsigned long      header_offset;
+       unsigned long      header_position;
+       unsigned long      length;
        unsigned long      version;
        unsigned short int sessions;
        unsigned short int tracks;
@@ -22,13 +22,13 @@ typedef struct track_s
        {
        unsigned short int global_current_track;
        unsigned short int number;
-       long               position;
+       unsigned long      position;
        unsigned long      mode;
        unsigned long      sector_size;
        unsigned long      sector_size_value;
-       long               length;
-       long               pregap_length;
-       long               total_length;
+       unsigned long      length;
+       unsigned long      pregap_length;
+       unsigned long      total_length;
        unsigned long      start_lba;
        unsigned char      filename_length;
        } track_s;
