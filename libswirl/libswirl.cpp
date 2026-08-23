@@ -247,6 +247,7 @@ void InitSettings()
     settings.dynarec.opt_div1_som = true;  
     settings.dynarec.opt_sqw_on_pref = false;
     settings.dynarec.opt_sqw_rewrite = false;
+    settings.dynarec.opt_anchored_loops = false;
     settings.dynarec.opt_constprop = 1;
     settings.dynarec.opt_readm_pairs = 0;
     settings.dynarec.opt_fipr_w = 1;
@@ -315,6 +316,7 @@ void LoadSettings(bool game_specific)
     settings.dynarec.opt_div1_som = cfgLoadBool(config_section, "Dynarec.opt_div1_som", settings.dynarec.opt_div1_som);
     settings.dynarec.opt_sqw_on_pref = cfgLoadBool(config_section, "Dynarec.opt_sqw_on_pref", settings.dynarec.opt_sqw_on_pref);
     settings.dynarec.opt_sqw_rewrite = cfgLoadBool(config_section, "Dynarec.opt_sqw_rewrite", settings.dynarec.opt_sqw_rewrite);
+    settings.dynarec.opt_anchored_loops = cfgLoadBool(config_section, "Dynarec.opt_anchored_loops", settings.dynarec.opt_anchored_loops);
     settings.dynarec.opt_constprop = cfgLoadInt(config_section, "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
     settings.dynarec.opt_readm_pairs = cfgLoadBool(config_section, "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
     settings.dynarec.opt_fipr_w = cfgLoadBool(config_section, "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);
@@ -431,6 +433,7 @@ void SaveSettings()
 	cfgSaveBool("config", "Dynarec.opt_div1_som", settings.dynarec.opt_div1_som);
 	cfgSaveBool("config", "Dynarec.opt_sqw_on_pref", settings.dynarec.opt_sqw_on_pref);
     cfgSaveBool("config", "Dynarec.opt_sqw_rewrite", settings.dynarec.opt_sqw_rewrite);
+    cfgSaveBool("config", "Dynarec.opt_anchored_loops", settings.dynarec.opt_anchored_loops);
 	cfgSaveInt("config", "Dynarec.opt_constprop", settings.dynarec.opt_constprop);
 	cfgSaveBool("config", "Dynarec.opt_readm_pairs", settings.dynarec.opt_readm_pairs);
 	cfgSaveBool("config", "Dynarec.opt_fipr_w", settings.dynarec.opt_fipr_w);

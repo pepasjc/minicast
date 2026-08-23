@@ -477,6 +477,7 @@ struct settings_t
 		bool opt_div1_som;		// match div1 for div32u/s
 		bool opt_sqw_on_pref;	// on write before pref, assume SQW
 		bool opt_sqw_rewrite;	// On rewrite to SQW, always assume SQW
+		bool opt_anchored_loops;	// detect static loops from anchor blocks and compile them as regions (CompileLoop)
 		int opt_constprop;		// 0 = 0ff, 1 = safe, 2 = include page constant
 		bool opt_readm_pairs; 	// fuse +0 and +4 addresses on same base reg
 		bool opt_fipr_w;		// simplify fipr if w is provably 0 or 1

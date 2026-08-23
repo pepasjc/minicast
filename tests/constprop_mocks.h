@@ -318,3 +318,5 @@ inline bool bm_RamPageHasData(u32 guest_addr, u32 len)
 		rv |= mock_page_has_data[i];
 	return rv;
 }
+
+#define printf_sqwm(...)

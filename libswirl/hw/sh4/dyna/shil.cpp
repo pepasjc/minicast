@@ -16,6 +16,9 @@
 #include "hw/sh4/sh4_mem.h"
 #include "blockmanager.h"
 
+
+#define printf_sqwm(...) 
+
 u32 RegisterWrite[sh4_reg_count];
 u32 RegisterRead[sh4_reg_count];
 
@@ -141,12 +144,12 @@ bool sq_pref(RuntimeBlockInfo* blk, int i, Sh4RegType rt, bool mark)
 	{
 		blk->oplist[i].flags =0x1337;
 		sq_pref(blk,i,rt,true);
-		printf("SQW-WM match %d !\n",data);
+		printf_sqwm("SQW-WM match %d !\n",data);
 		return true;
 	}
 	else if (data)
 	{
-		printf("SQW-WM FAIL %d !\n",data);
+		printf_sqwm("SQW-WM FAIL %d !\n",data);
 		return false;
 	}
 	return false;
@@ -1762,9 +1765,9 @@ bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInf
 				(*loop_out)[rbi->addr] = rbi;
 		}
 
-		printf("FOUND loop: anchor %08X header %08X, %u cycle blocks / %zu explored%s\n",
-			anchor_rbi->addr, header, members, loop_rbis.size(),
-			partial ? " (graph partial)" : "");
+		// printf("FOUND loop: anchor %08X header %08X, %u cycle blocks / %zu explored%s\n",
+		// 	anchor_rbi->addr, header, members, loop_rbis.size(),
+		// 	partial ? " (graph partial)" : "");
 
 		// std::map<u32, RuntimeBlockInfo*> loop_print;
 		// for (auto rbi : loop_rbis) {
@@ -1897,7 +1900,7 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 	//read_v4m3z1(blk);
 	//rw_related(blk);
 
-	if (anchor) {
+	if (anchor && settings.dynarec.opt_anchored_loops) {
 		anchor_blocks.insert(blk);
 	}
 	return;	//disbled to be on the safe side ..

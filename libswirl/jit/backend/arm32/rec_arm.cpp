@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include "types.h"
 
+#define printf_loop(...) // printf(__VA_ARGS__)
+
 #if FEAT_SHREC == DYNAREC_JIT
 #include "hw/sh4/sh4_opcode_list.h"
 
@@ -3353,13 +3355,13 @@ struct Arm32NGenBackend: NGenBackend
 		bool doLock = !bm_RamPageHasData(loop->addr, loop->sh4_code_size);
 		bm_AddBlock(loop, doLock);
 
-		printf("CompileLoop: %08X..%08X, %zu members, %d bytes host code, overlay %u gpr + %u fpu\n",
+		printf_loop("CompileLoop: %08X..%08X, %zu members, %d bytes host code, overlay %u gpr + %u fpu\n",
 			loop->addr, span_end, blocks.size(), loop->host_code_size,
 			n_ov_g, n_ov_f*2);
 		for (u32 i=0;i<n_ov_g;i++)
-			printf("  ov gpr guest#%d (%u uses) -> host r%d\n", gcand[i].key, gcand[i].score, (int)g_hosts[i]);
+			printf_loop("  ov gpr guest#%d (%u uses) -> host r%d\n", gcand[i].key, gcand[i].score, (int)g_hosts[i]);
 		for (u32 i=0;i<n_ov_f;i++)
-			printf("  ov fpu fr%d/fr%d (%u uses) -> host s%d/s%d\n",
+			printf_loop("  ov fpu fr%d/fr%d (%u uses) -> host s%d/s%d\n",
 				fcand[i].key, fcand[i].key+1, fcand[i].score, (int)(f16+i*2), (int)(f16+i*2+1));
 
 		//the overlay only applies inside this region; normal Compile() must
