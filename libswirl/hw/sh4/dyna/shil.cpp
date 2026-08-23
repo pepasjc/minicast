@@ -1689,6 +1689,115 @@ static bool anchor_succs(RuntimeBlockInfo* rbi, RuntimeBlockInfo* succ[2])
 }
 
 /*
+	Multiblock-aware SQ store/pref marking, run over a detected loop's member
+	set before CompileLoop. The per-block matcher (sq_pref above) needs the
+	stores and the pref in one block and counts bytes; real loops split them
+	across members (the pref rides a branch delay slot in the successor
+	block) and overwrite bytes (pointer-as-PCW tricks make the naive byte sum
+	36 != 32), so it misses. Region-level the confidence test is stronger and
+	simpler, per base register used by a pref:
+	  - write-only within the region: nothing reads through the base (a
+	    store queue cannot be read back)
+	  - the base is only ever redefined by add/sub immediate (address
+	    arithmetic walking the SQ lines)
+	  - only plain 32/64-bit stores through it (the sq_both fast path exists
+	    only for those)
+	Every writem through such a base and every pref of it get marked; the
+	region emission then uses the inline sq_both forms - no runtime checks,
+	no per-block slowpath calls, no first-touch fault rewrites.
+
+	Same trust model as the per-block matcher, so the same gate:
+	opt_sqw_on_pref ("on write before pref, assume SQW"). Marks live in the
+	member oplists but only the region emission consumes them - the
+	fragments' code is already emitted, and a fragment recompile rebuilds
+	its oplist from scratch.
+*/
+void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks)
+{
+	if (!settings.dynarec.opt_sqw_on_pref)
+		return;
+
+	//candidate bases: registers pref'd anywhere in the region
+	std::set<u32> cand;
+	for (auto& kv : blocks)
+		for (auto& op : kv.second->oplist)
+			if (op.op==shop_pref && op.rs1.is_r32i())
+				cand.insert((u32)op.rs1._reg);
+
+	for (auto rt : cand)
+	{
+		bool ok=true;
+		u32 stores=0;
+
+		for (auto& kv : blocks)
+		{
+			for (auto& op : kv.second->oplist)
+			{
+				if (op.op==shop_readm && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					ok=false;	//read through the base: not a store queue
+					break;
+				}
+
+				if (op.op==shop_writem && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					u32 sz=op.flags&0x7F;
+					bool grouped=(op.flags&0x80)!=0;
+					bool val_ok=op.rs2.is_r32i()||op.rs2.is_r32f()||op.rs2.is_r64f()||op.rs2.is_r32fv();
+
+					if (grouped || (sz!=4 && sz!=8) || !val_ok)
+					{
+						ok=false;	//no sq_both fast path for this store form
+						break;
+					}
+					stores++;
+					continue;
+				}
+
+				//any other redefinition of the base makes it unknowable
+				const shil_param* wr[2]={&op.rd,&op.rd2};
+				for (int w=0;w<2 && ok;w++)
+				{
+					if (!wr[w]->is_reg())
+						continue;
+					if (rt<(u32)wr[w]->_reg || rt>=(u32)wr[w]->_reg+wr[w]->count())
+						continue;
+
+					bool arith=(op.op==shop_add || op.op==shop_sub) &&
+						op.rs1.is_reg() && (u32)op.rs1._reg==rt && op.rs2.is_imm();
+					if (!arith)
+						ok=false;
+				}
+				if (!ok)
+					break;
+			}
+			if (!ok)
+				break;
+		}
+
+		if (!ok || !stores)
+			continue;
+
+		u32 marked=0;
+		for (auto& kv : blocks)
+		{
+			for (auto& op : kv.second->oplist)
+			{
+				if (op.op==shop_writem && op.rs1.is_reg() && (u32)op.rs1._reg==rt)
+				{
+					op.flags2=0x1337;
+					marked++;
+				}
+				if (op.op==shop_pref && op.rs1.is_r32i() && (u32)op.rs1._reg==rt)
+					op.flags=0x1337;
+			}
+		}
+
+		printf_sqwm("sq_pref_multiblock: base guest#%u, %u stores marked SQ\n", rt, marked);
+	}
+}
+
+/*
 	Region-growth probe: does any static path from 'start' lead to an edge
 	targeting 'header'? An installed region's exit target that can reach the
 	header again is a loop path that only got compiled after the region was

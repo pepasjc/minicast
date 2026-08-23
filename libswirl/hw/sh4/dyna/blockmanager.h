@@ -136,6 +136,10 @@ bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInf
 //and the region at 'header' should be regrown.
 bool anchor_reaches_header(u32 start, u32 header);
 
+//Multiblock SQ store/pref marking over a loop's member set (shil.cpp); call
+//before ngen->CompileLoop(). Gated on opt_sqw_on_pref.
+void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks);
+
 void bm_Init();
 void bm_Term();
 

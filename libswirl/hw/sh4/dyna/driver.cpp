@@ -26,6 +26,7 @@
 #include "perf_map.h"
 
 #define bm_printf(...)
+#define printf_loop(...)
 
 #if FEAT_SHREC != DYNAREC_NONE
 
@@ -412,7 +413,7 @@ static void loop_region_probe()
 		return;
 	}
 
-	printf("Loop region %08X: late-compiled loop path closes the cycle, regrowing\n",rec.header);
+	printf_loop("Loop region %08X: late-compiled loop path closes the cycle, regrowing\n",rec.header);
 
 	//discard the region (severs incoming links; the head recompiles as a
 	//normal fragment on next entry) and reseed the detector from a live
@@ -475,6 +476,11 @@ u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 					else
 						anchor_blocks.erase(it);
 				}
+
+				// cross-block SQ marking over the member set: the stores and
+				// their pref live in different members (delay-slot prefs),
+				// which the per-block matcher cannot see
+				sq_pref_multiblock(loop);
 
 				// build the growth-probe record BEFORE the compile: it
 				// discards (and may free) the head fragment
