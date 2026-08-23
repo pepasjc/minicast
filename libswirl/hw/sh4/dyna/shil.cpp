@@ -1688,6 +1688,52 @@ static bool anchor_succs(RuntimeBlockInfo* rbi, RuntimeBlockInfo* succ[2])
 	return complete;
 }
 
+/*
+	Region-growth probe: does any static path from 'start' lead to an edge
+	targeting 'header'? An installed region's exit target that can reach the
+	header again is a loop path that only got compiled after the region was
+	built (games routinely leave loop arms unexecuted until much later) - the
+	region should be discarded and regrown to include it.
+
+	Tests edge ADDRESSES against the header rather than blocks: the block at
+	the header is the opaque region itself, so the walk can never pass through
+	it - an edge pointing at it is what closes the cycle.
+*/
+bool anchor_reaches_header(u32 start, u32 header)
+{
+	RuntimeBlockInfo* first=bm_GetBlock(start);
+	if (!first)
+		return false;
+
+	std::set<RuntimeBlockInfo*> seen;
+	std::set<RuntimeBlockInfo*> todo;
+	todo.insert(first);
+
+	for (int i=0;i<32 && todo.size();i++)
+	{
+		auto rbi=*todo.begin();
+		todo.erase(todo.begin());
+		seen.insert(rbi);
+
+		if (rbi->BlockType==BET_Cond_0 || rbi->BlockType==BET_Cond_1 || rbi->BlockType==BET_StaticJump)
+		{
+			if (rbi->BranchBlock==header)
+				return true;
+			if (rbi->BlockType!=BET_StaticJump && rbi->NextBlock==header)
+				return true;
+		}
+
+		RuntimeBlockInfo* succ[2];
+		anchor_succs(rbi,succ);
+
+		for (auto s : succ)
+			if (s && !seen.count(s))
+				todo.insert(s);
+	}
+
+	return false;
+}
+
 bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out) {
 	// find loop
 

@@ -131,6 +131,11 @@ void bm_Sort();
 //address - the lowest address is the header - ready for ngen->CompileLoop().
 bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out = nullptr);
 
+//Region-growth probe (shil.cpp): true when a static path from 'start' reaches
+//an edge targeting 'header' - i.e. a later-compiled loop arm closed the cycle
+//and the region at 'header' should be regrown.
+bool anchor_reaches_header(u32 start, u32 header);
+
 void bm_Init();
 void bm_Term();
 

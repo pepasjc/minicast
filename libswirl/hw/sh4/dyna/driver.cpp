@@ -363,6 +363,84 @@ typedef set<RuntimeBlockInfo*> bm_List;
 extern bm_List::iterator current_anchor_block;
 extern bm_List anchor_blocks;
 
+//installed loop regions, kept for the growth probe: a region compiled while
+//some loop arms were still unexecuted (and so uncompiled) under-covers the
+//loop; when such an arm later compiles and closes a cycle back to the header,
+//the region is discarded and the detector reseeded to build the bigger one
+struct loop_region_rec
+{
+	u32 header;
+	RuntimeBlockInfo* rbi;			//identity only - never dereferenced
+	std::vector<u32> members;
+	std::vector<u32> exits;
+};
+
+static std::vector<loop_region_rec> loop_regions;
+static size_t loop_region_probe_idx;
+
+static void loop_region_probe()
+{
+	if (loop_regions.empty())
+		return;
+
+	if (loop_region_probe_idx>=loop_regions.size())
+		loop_region_probe_idx=0;
+
+	loop_region_rec& rec=loop_regions[loop_region_probe_idx];
+
+	//the region got invalidated or replaced behind our back: forget it (a
+	//fresh detection will re-record whatever replaces it)
+	if (bm_GetBlock(rec.header)!=rec.rbi)
+	{
+		loop_regions.erase(loop_regions.begin()+loop_region_probe_idx);
+		return;
+	}
+
+	bool grown=false;
+	for (auto ex : rec.exits)
+	{
+		if (anchor_reaches_header(ex,rec.header))
+		{
+			grown=true;
+			break;
+		}
+	}
+
+	if (!grown)
+	{
+		loop_region_probe_idx++;
+		return;
+	}
+
+	printf("Loop region %08X: late-compiled loop path closes the cycle, regrowing\n",rec.header);
+
+	//discard the region (severs incoming links; the head recompiles as a
+	//normal fragment on next entry) and reseed the detector from a live
+	//member fragment - preferably the back edge. The walk stays partial
+	//until the head fragment exists again, so the anchor is simply retried,
+	//and the eventual find includes the new arm.
+	bm_DiscardBlock(bm_GetBlock(rec.header));
+
+	RuntimeBlockInfo* seed=0;
+	for (auto ma : rec.members)
+	{
+		RuntimeBlockInfo* mb=bm_GetBlock(ma);
+		if (!mb)
+			continue;
+		if (!seed)
+			seed=mb;
+		if (mb->BranchBlock==rec.header || mb->NextBlock==rec.header)
+		{
+			seed=mb;
+			break;
+		}
+	}
+	if (seed)
+		anchor_blocks.insert(seed);
+
+	loop_regions.erase(loop_regions.begin()+loop_region_probe_idx);
+}
+
 void bm_Rebuild();
 u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 {
@@ -398,12 +476,42 @@ u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 						anchor_blocks.erase(it);
 				}
 
+				// build the growth-probe record BEFORE the compile: it
+				// discards (and may free) the head fragment
+				loop_region_rec rec;
+				rec.header = loop.begin()->first;
+				for (auto& kv : loop) {
+					rec.members.push_back(kv.first);
+
+					RuntimeBlockInfo* m = kv.second;
+					if (m->BranchBlock != 0xFFFFFFFF && !loop.count(m->BranchBlock))
+						rec.exits.push_back(m->BranchBlock);
+					if ((m->BlockType == BET_Cond_0 || m->BlockType == BET_Cond_1) &&
+						m->NextBlock != 0xFFFFFFFF && !loop.count(m->NextBlock))
+						rec.exits.push_back(m->NextBlock);
+				}
+				RuntimeBlockInfo* before = loop.begin()->second;
+
 				rdv_ngen->CompileLoop(loop);
+
+				// record only if a region was actually installed (the compile
+				// bails quietly when the code cache is tight); identity
+				// compare only - 'before' may already be freed
+				rec.rbi = bm_GetBlock(rec.header);
+				if (rec.rbi && rec.rbi != before)
+					loop_regions.push_back(rec);
 			}
 		} else {
 			current_anchor_block++;
 		}
 	}
+
+	// growth probe, decimated: one region per 64 calls is plenty (regrowth
+	// latency stays in the milliseconds while the walks stay off the profile)
+	static u32 probe_tick;
+	if ((++probe_tick & 63) == 0)
+		loop_region_probe();
+
 	return rdv_DoInterrupts_pc(pc);
 }
 
