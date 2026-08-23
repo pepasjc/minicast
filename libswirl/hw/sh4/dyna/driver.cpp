@@ -358,9 +358,29 @@ u32 DYNACALL rdv_DoInterrupts_pc(u32 pc) {
 	return next_pc;
 }
 
+typedef set<RuntimeBlockInfo*> bm_List;
+
+extern bm_List::iterator current_anchor_block;
+extern bm_List anchor_blocks;
+bool optimize_anchor(RuntimeBlockInfo* rbi);
+
 void bm_Rebuild();
 u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 {
+	// round-robin over the pending anchors, one per call; wrap so anchors
+	// inserted after the cursor ran off the end still get scanned
+	if (current_anchor_block == anchor_blocks.end()) {
+		current_anchor_block = anchor_blocks.begin();
+	}
+
+	if (current_anchor_block != anchor_blocks.end()) {
+		auto blk = *current_anchor_block;
+		if (optimize_anchor(blk)) {
+			current_anchor_block = anchor_blocks.erase(current_anchor_block);
+		} else {
+			current_anchor_block++;
+		}
+	}
 	RuntimeBlockInfo* rbi = bm_GetBlock(block_cpde);
 	return rdv_DoInterrupts_pc(rbi->addr);
 }

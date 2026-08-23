@@ -124,6 +124,11 @@ void bm_Periodical_1s();
 void bm_Periodical_14k();
 void bm_Sort();
 
+//Loop-idiom detection (shil.cpp): walk static edges from the anchor and look
+//for a cycle back through it. true = settled (loop found and reported, or
+//provably no loop); false = graph incomplete, retry once more code compiled.
+bool optimize_anchor(RuntimeBlockInfo* anchor_rbi);
+
 void bm_Init();
 void bm_Term();
 

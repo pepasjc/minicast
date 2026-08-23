@@ -34,6 +34,11 @@
 typedef set<RuntimeBlockInfo*> bm_List;
 
 bm_List all_blocks;
+bm_List anchor_blocks;
+//must start as end(), not default-constructed: a singular set iterator has a
+//null node, compares != end() and crashes on the first dereference.
+//(same-TU definition order guarantees anchor_blocks is constructed first)
+bm_List::iterator current_anchor_block = anchor_blocks.end();
 bm_List del_blocks;
 
 bm_List page_blocks[RAM_SIZE/PAGE_SIZE];
@@ -154,6 +159,10 @@ void bm_DiscardBlock(RuntimeBlockInfo* blk)
 
 	blkmap.erase((void*)blk->code);
 	all_blocks.erase(blk);
+	if (current_anchor_block != anchor_blocks.end() && *current_anchor_block == blk) {
+		current_anchor_block = anchor_blocks.end();
+	}
+	anchor_blocks.erase(blk);
 	
 	blk->Discard();
 
