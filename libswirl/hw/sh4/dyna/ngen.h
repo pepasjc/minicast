@@ -118,6 +118,16 @@ struct NGenBackend
 	//Called to compile a block
 	virtual void Compile(RuntimeBlockInfo* block, SmcCheckEnum smc_checks, bool reset, bool staging, bool optimise) = 0;
 
+	//Compile a detected static loop (map keyed by guest address; the lowest
+	//address is the header/entry). The loop registers only its head in the
+	//lookup tables; members keep their fragments for side entries. Internal
+	//edges are direct branches, edges leaving the set dispatch through FPCA -
+	//no link records, no rewrites. No SMC entry checks (the span still
+	//participates in page invalidation), no interrupt polling - cycles are
+	//counted and the debt settles at the first normal block after exit.
+	//Default: backend has no loop support, silently skip.
+	virtual void CompileLoop(std::map<u32, RuntimeBlockInfo*>& blocks) { }
+
 	//Called when blocks are reseted
 	virtual void OnResetBlocks() = 0;
 

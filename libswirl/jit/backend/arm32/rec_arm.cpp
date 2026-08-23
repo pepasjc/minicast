@@ -16,6 +16,7 @@
 #include "hw/sh4/sh4_interrupts.h"
 #include "hw/sh4/sh4_core.h"
 #include "hw/sh4/dyna/ngen.h"
+#include "hw/sh4/dyna/perf_map.h"
 #include "hw/sh4/sh4_mem.h"
 
 #include "ngen_arm.h"
@@ -2771,6 +2772,276 @@ struct Arm32NGenBackend: NGenBackend
 
 		void emit_WriteCodeCache();
 	//	emit_WriteCodeCache();
+	}
+
+	//--- loop (multi-block region) compilation -------------------------------
+	//
+	//v1: each member keeps its own per-block register allocation, so the
+	//context is fully coherent at every member boundary - that is what makes
+	//plain internal branches sound with the linear span model. Cross-member
+	//carrying is the next layer and slots in at exactly these boundaries.
+
+	struct loop_edge_fixup
+	{
+		u32* slot;          //placeholder branch instruction to patch
+		u32 target;         //guest address of the (forward) member target
+		ConditionCode cc;
+	};
+
+	//emit the dynamic dispatch used by the region's exits: same FPCA-indexed
+	//jump the dynamic block ends use, target pc in r4
+	void emit_loop_dispatch(u32 target)
+	{
+		MOV32(r4,target);
+		SUB(r2, r8, -FPCB_OFFSET);
+#if RAM_SIZE_MAX == 33554432
+		UBFX(r1, r4, 1, 24);
+#else
+		UBFX(r1, r4, 1, 23);
+#endif
+		LDR(r15,r2,r1,Offset,true,S_LSL,2);
+	}
+
+	//one control edge out of a member: direct branch when the target is a
+	//member (fixup when not yet emitted), FPCA dispatch stub when it leaves
+	//the region. fallthrough_addr is the member emitted right after.
+	void emit_loop_edge(u32 target, ConditionCode cc,
+		std::map<u32, RuntimeBlockInfo*>& blocks, std::map<u32, u32>& mpos,
+		std::vector<loop_edge_fixup>& fixups, u32 fallthrough_addr)
+	{
+		if (blocks.count(target))
+		{
+			if (cc==CC_AL && target==fallthrough_addr)
+				return;
+
+			auto it=mpos.find(target);
+			if (it!=mpos.end())
+			{
+				JUMP(it->second,cc);
+			}
+			else
+			{
+				fixups.push_back({(u32*)EMIT_GET_PTR(),target,cc});
+				NOP();
+			}
+			return;
+		}
+
+		//exit stub; for a conditional edge, branch around it on the inverse
+		u32* skip=0;
+		if (cc!=CC_AL)
+		{
+			skip=(u32*)EMIT_GET_PTR();
+			NOP();
+		}
+
+		emit_loop_dispatch(target);
+
+		if (skip)
+		{
+			u32 after=(u32)EMIT_GET_PTR();
+			verify(emit_ptr==0);
+			emit_ptr=skip;
+			JUMP(after,(ConditionCode)(cc^1));
+			verify(emit_ptr==skip+1);
+			emit_ptr=0;
+		}
+	}
+
+	//member terminal: mirrors DynaRBI::Relink's condition selection, in the
+	//same post-writeback state (str/vstr/movw do not touch the flags)
+	void emit_loop_terminal(RuntimeBlockInfo* m,
+		std::map<u32, RuntimeBlockInfo*>& blocks, std::map<u32, u32>& mpos,
+		std::vector<loop_edge_fixup>& fixups, u32 fallthrough_addr)
+	{
+		if (m->BlockType==BET_StaticJump)
+		{
+			emit_loop_edge(m->BranchBlock,CC_AL,blocks,mpos,fixups,fallthrough_addr);
+			return;
+		}
+
+		verify(m->BlockType==BET_Cond_0 || m->BlockType==BET_Cond_1);
+
+		shil_opcode* last = m->oplist.size() ? &m->oplist[m->oplist.size()-1] : 0;
+		bool flags = !m->has_jcond && last && last->rd._reg==reg_sr_T && ccmap.count(last->op);
+
+		ConditionCode CC;
+		if (flags)
+		{
+			CC = (m->BlockType&1)==1 ? ccmap[last->op] : ccnmap[last->op];
+		}
+		else
+		{
+			if (!m->has_jcond)
+				LoadSh4Reg_mem(r4,reg_sr_T);
+			CMP(r4,(m->BlockType&1));
+			CC = CC_EQ;
+		}
+
+		emit_loop_edge(m->BranchBlock,CC,blocks,mpos,fixups,fallthrough_addr);
+		emit_loop_edge(m->NextBlock,CC_AL,blocks,mpos,fixups,fallthrough_addr);
+	}
+
+	void CompileLoop(std::map<u32, RuntimeBlockInfo*>& blocks)
+	{
+		verify(blocks.size());
+
+		//space check: a member compiles to roughly its fragment size; skip
+		//quietly when the cache is tight rather than risking the tail
+		if (emit_FreeSpace()<128*1024)
+			return;
+
+		RuntimeBlockInfo* head=blocks.begin()->second;
+
+		u32 span_end=0;
+		u32 guest_ops=0;
+		u32 guest_cyc=0;
+		for (auto& kv : blocks)
+		{
+			RuntimeBlockInfo* m=kv.second;
+			verify(kv.first==m->addr);
+			//the detector only walks static edges, so members can only end
+			//in these; anything else here is a caller bug
+			verify(m->BlockType==BET_Cond_0 || m->BlockType==BET_Cond_1 || m->BlockType==BET_StaticJump);
+			if (m->addr+m->sh4_code_size>span_end)
+				span_end=m->addr+m->sh4_code_size;
+			guest_ops+=m->guest_opcodes;
+			guest_cyc+=m->guest_cycles;
+		}
+
+		DynaRBI* loop=(DynaRBI*)AllocateBlock();
+
+		//no Setup(): that would re-decode. Fill what the blockmanager and the
+		//discard/lookup paths read.
+		loop->addr=head->addr;
+		loop->lookups=0;
+		loop->host_code_size=0;
+		loop->sh4_code_size=span_end-head->addr;
+		loop->runs=0;
+		loop->staging_runs=0;
+		loop->fpu_cfg=head->fpu_cfg;
+		loop->guest_cycles=guest_cyc;
+		loop->guest_opcodes=guest_ops;
+		loop->host_opcodes=0;
+		//opaque end: no static links out (exits dispatch via FPCA), and the
+		//loop detector will not chase through it
+		loop->BlockType=BET_DynamicJump;
+		loop->BranchBlock=0xFFFFFFFF;
+		loop->NextBlock=0xFFFFFFFF;
+		loop->pBranchBlock=0;
+		loop->pNextBlock=0;
+		loop->relink_data=0;
+		loop->csc_RetCache=0;
+		loop->has_jcond=false;
+		loop->static_from_constprop=false;
+		loop->host_preload0=0;
+		loop->host_preload0_end=0;
+		loop->memops=0;
+		loop->linkedmemops=0;
+
+		loop->code=(DynarecCodeEntryPtr)EMIT_GET_PTR();
+		u8* blk_start=(u8*)EMIT_GET_PTR();
+
+		std::map<u32, u32> mpos;                //member addr -> emitted host addr
+		std::vector<loop_edge_fixup> fixups;    //forward branches to patch
+
+		for (auto it=blocks.begin(); it!=blocks.end(); it++)
+		{
+			RuntimeBlockInfo* m=it->second;
+
+			auto next_it=std::next(it);
+			u32 fallthrough_addr = next_it!=blocks.end() ? next_it->first : 1;
+
+			mpos[m->addr]=(u32)EMIT_GET_PTR();
+
+			//count cycles, never poll (design: these loops are not spin
+			//loops; the debt settles at the first normal block after exit)
+			u32 cyc=m->guest_cycles;
+			if (!is_i8r4(cyc))
+				cyc&=~3;
+			if (cyc)
+			{
+#if HOST_OS == OS_DARWIN
+				SUB(r11,r11,cyc,false,CC_AL);
+#else
+				SUB(rfp_r9,rfp_r9,cyc,false,CC_AL);
+#endif
+			}
+
+			if (m->oplist.size())
+			{
+				fpu_temps_avail=false;
+				for (size_t i=0;i<m->oplist.size();i++)
+				{
+					if (m->oplist[i].op==shop_ftrv || m->oplist[i].op==shop_fipr)
+					{
+						fpu_temps_avail=true;
+						break;
+					}
+				}
+				xmtrx_resident=false;
+
+				reg.block_loops=false;
+				reg.DoAlloc(m,alloc_regs,fpu_temps_avail?alloc_fpu_temps:alloc_fpu);
+				reg.OpBegin(&m->oplist[0],0);
+
+				for (size_t i=0;i<m->oplist.size();i++)
+				{
+					shil_opcode* op=&m->oplist[i];
+
+					if (i!=0)
+						reg.OpBegin(op,i);
+
+					ngen_compile_opcode(m,op,false,true);
+
+					if (xmtrx_resident && op_kills_xmtrx(op))
+						xmtrx_resident=false;
+
+					reg.OpEnd(op);
+				}
+			}
+
+			emit_loop_terminal(m,blocks,mpos,fixups,fallthrough_addr);
+		}
+
+		//patch the forward internal branches
+		for (auto& f : fixups)
+		{
+			auto it=mpos.find(f.target);
+			verify(it!=mpos.end());
+
+			verify(emit_ptr==0);
+			emit_ptr=f.slot;
+			JUMP(it->second,f.cc);
+			verify(emit_ptr==f.slot+1);
+			emit_ptr=0;
+		}
+
+		//point the never-used relink area at a pad inside the block, so a
+		//stray Relink() cannot write over the next block in the cache
+		loop->relink_offset=(u8*)EMIT_GET_PTR()-(u8*)loop->code;
+		for (int i=0;i<8;i++)
+			NOP();
+
+		u8* pEnd=(u8*)EMIT_GET_PTR();
+		CacheFlush((void*)loop->code,pEnd);
+
+		loop->host_opcodes=(pEnd-blk_start)/4;
+		loop->host_code_size=pEnd-(u8*)loop->code;
+
+		//install: retire the head fragment first (severs its incoming links;
+		//they re-link through the dispatcher and land on the loop), then
+		//claim the head address. Members other than the head stay alive for
+		//side entries.
+		bm_DiscardBlock(head);
+
+		perf_map_AddBlock((void*)CC_RW2RX(loop->code), loop->host_code_size, loop->addr, loop->sh4_code_size);
+
+		bool doLock = !bm_RamPageHasData(loop->addr, loop->sh4_code_size);
+		bm_AddBlock(loop, doLock);
+
+		printf("CompileLoop: %08X..%08X, %zu members, %d bytes host code\n",
+			loop->addr, span_end, blocks.size(), loop->host_code_size);
 	}
 
 	void OnResetBlocks()

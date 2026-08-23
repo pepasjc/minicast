@@ -1685,7 +1685,7 @@ static bool anchor_succs(RuntimeBlockInfo* rbi, RuntimeBlockInfo* succ[2])
 	return complete;
 }
 
-bool optimize_anchor(RuntimeBlockInfo* anchor_rbi) {
+bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out) {
 	// find loop
 
 	std::set<RuntimeBlockInfo*> loop_rbis;
@@ -1757,6 +1757,9 @@ bool optimize_anchor(RuntimeBlockInfo* anchor_rbi) {
 			if (rbi->addr < header)
 				header = rbi->addr;
 			members++;
+
+			if (loop_out)
+				(*loop_out)[rbi->addr] = rbi;
 		}
 
 		printf("FOUND loop: anchor %08X header %08X, %u cycle blocks / %zu explored%s\n",

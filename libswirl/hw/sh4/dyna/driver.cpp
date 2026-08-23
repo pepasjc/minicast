@@ -362,11 +362,16 @@ typedef set<RuntimeBlockInfo*> bm_List;
 
 extern bm_List::iterator current_anchor_block;
 extern bm_List anchor_blocks;
-bool optimize_anchor(RuntimeBlockInfo* rbi);
 
 void bm_Rebuild();
 u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 {
+	// resolve the interrupted block's pc FIRST: the loop compile below may
+	// discard exactly this block (head fragment replacement), after which the
+	// code-range lookup no longer finds it
+	RuntimeBlockInfo* rbi = bm_GetBlock(block_cpde);
+	u32 pc = rbi->addr;
+
 	// round-robin over the pending anchors, one per call; wrap so anchors
 	// inserted after the cursor ran off the end still get scanned
 	if (current_anchor_block == anchor_blocks.end()) {
@@ -375,14 +380,31 @@ u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 
 	if (current_anchor_block != anchor_blocks.end()) {
 		auto blk = *current_anchor_block;
-		if (optimize_anchor(blk)) {
+		std::map<u32, RuntimeBlockInfo*> loop;
+		if (optimize_anchor(blk, &loop)) {
 			current_anchor_block = anchor_blocks.erase(current_anchor_block);
+
+			if (!loop.empty()) {
+				// the other members would only re-find the same loop; drop
+				// them from the anchor pool (minding the cursor) before the
+				// compile discards the head fragment
+				for (auto& kv : loop) {
+					auto it = anchor_blocks.find(kv.second);
+					if (it == anchor_blocks.end())
+						continue;
+					if (it == current_anchor_block)
+						current_anchor_block = anchor_blocks.erase(it);
+					else
+						anchor_blocks.erase(it);
+				}
+
+				rdv_ngen->CompileLoop(loop);
+			}
 		} else {
 			current_anchor_block++;
 		}
 	}
-	RuntimeBlockInfo* rbi = bm_GetBlock(block_cpde);
-	return rdv_DoInterrupts_pc(rbi->addr);
+	return rdv_DoInterrupts_pc(pc);
 }
 
 DynarecCodeEntryPtr DYNACALL rdv_BlockCheckFail(u32 pc)

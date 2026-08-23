@@ -127,7 +127,9 @@ void bm_Sort();
 //Loop-idiom detection (shil.cpp): walk static edges from the anchor and look
 //for a cycle back through it. true = settled (loop found and reported, or
 //provably no loop); false = graph incomplete, retry once more code compiled.
-bool optimize_anchor(RuntimeBlockInfo* anchor_rbi);
+//On a find, loop_out (if given) receives the cycle members keyed by guest
+//address - the lowest address is the header - ready for ngen->CompileLoop().
+bool optimize_anchor(RuntimeBlockInfo* anchor_rbi, std::map<u32, RuntimeBlockInfo*>* loop_out = nullptr);
 
 void bm_Init();
 void bm_Term();
