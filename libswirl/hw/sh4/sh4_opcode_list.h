@@ -45,6 +45,7 @@ struct sh4_opcodelistentry
 {
 	RecOpCallFP* rec_oph;
 	OpCallFP* oph;
+	const char* oph_name;
 	u32 mask;
 	u32 rez;
 	u32 type;
