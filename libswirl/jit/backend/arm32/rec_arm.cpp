@@ -495,6 +495,53 @@ struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 
 arm_reg_alloc reg;
 
+//--- loop overlay state (CompileLoop): the cross-block resident registers and
+//their hosts, mirrored from reg's overlay tables for emission. loop_emitting
+//gates the spill/restore brackets that the CC (canonical op) hooks emit.
+static vector<std::pair<u32,eReg> > loop_ov_gpr;
+static vector<std::pair<u32,eFSReg> > loop_ov_fpu;
+static bool loop_emitting=false;
+
+static bool op_writes_greg(shil_opcode* op, u32 greg)
+{
+	const shil_param* wr[2]={&op->rd,&op->rd2};
+
+	for (int i=0;i<2;i++)
+		if (wr[i]->is_reg() && greg>=wr[i]->_reg && greg<wr[i]->_reg+wr[i]->count())
+			return true;
+
+	return false;
+}
+
+//commit the overlaid set to the context (before anything that reads guest
+//state through the context: canonical ptr args, ifb, the exit epilogue)
+static void emit_overlay_spill()
+{
+	for (size_t i=0;i<loop_ov_gpr.size();i++)
+		reg.Writeback(loop_ov_gpr[i].first,loop_ov_gpr[i].second);
+	for (size_t i=0;i<loop_ov_fpu.size();i++)
+		reg.Writeback_FPU(loop_ov_fpu[i].first,loop_ov_fpu[i].second);
+}
+
+//reload the overlaid set from the context. op!=null: a canonical op just ran
+//and its dests hold fresh results in their mapped (overlay) hosts - skip them
+//so the reload does not clobber them with the stale context copies. op==null:
+//the context is authoritative (region preamble, or an ifb-class op ran).
+static void emit_overlay_fill(shil_opcode* op)
+{
+	for (size_t i=0;i<loop_ov_gpr.size();i++)
+	{
+		if (op && op_writes_greg(op,loop_ov_gpr[i].first))
+			continue;
+		reg.Preload(loop_ov_gpr[i].first,loop_ov_gpr[i].second);
+	}
+	for (size_t i=0;i<loop_ov_fpu.size();i++)
+	{
+		if (op && op_writes_greg(op,loop_ov_fpu[i].first))
+			continue;
+		reg.Preload_FPU(loop_ov_fpu[i].first,loop_ov_fpu[i].second);
+	}
+}
 
 u32 blockno=0;
 
@@ -2788,11 +2835,14 @@ struct Arm32NGenBackend: NGenBackend
 		ConditionCode cc;
 	};
 
-	//emit the dynamic dispatch used by the region's exits: same FPCA-indexed
-	//jump the dynamic block ends use, target pc in r4
-	void emit_loop_dispatch(u32 target)
+	//FPCA-indexed dispatch on r4: same convention as the dynamic block ends.
+	//The region's exits all funnel through one shared epilogue (overlay
+	//writebacks + this jump); each exit records its branch slot here and gets
+	//patched once the epilogue's address is known.
+	std::vector<u32*> loop_exit_jumps;
+
+	void emit_fpca_jump()
 	{
-		MOV32(r4,target);
 		SUB(r2, r8, -FPCB_OFFSET);
 #if RAM_SIZE_MAX == 33554432
 		UBFX(r1, r4, 1, 24);
@@ -2827,7 +2877,8 @@ struct Arm32NGenBackend: NGenBackend
 			return;
 		}
 
-		//exit stub; for a conditional edge, branch around it on the inverse
+		//exit: set the target pc and funnel through the shared epilogue; for a
+		//conditional edge, branch around the stub on the inverse condition
 		u32* skip=0;
 		if (cc!=CC_AL)
 		{
@@ -2835,7 +2886,9 @@ struct Arm32NGenBackend: NGenBackend
 			NOP();
 		}
 
-		emit_loop_dispatch(target);
+		MOV32(r4,target);
+		loop_exit_jumps.push_back((u32*)EMIT_GET_PTR());
+		NOP();	//patched to jump to the epilogue
 
 		if (skip)
 		{
@@ -2872,9 +2925,16 @@ struct Arm32NGenBackend: NGenBackend
 		}
 		else
 		{
-			if (!m->has_jcond)
+			eReg tr=r4;
+
+			if (m->has_jcond)
+				;	//the jcond op staged the condition in r4
+			else if (reg.IsOverlaidg(reg_sr_T))
+				tr=reg.mapg(reg_sr_T);
+			else
 				LoadSh4Reg_mem(r4,reg_sr_T);
-			CMP(r4,(m->BlockType&1));
+
+			CMP(tr,(m->BlockType&1));
 			CC = CC_EQ;
 		}
 
@@ -2939,8 +2999,236 @@ struct Arm32NGenBackend: NGenBackend
 		loop->memops=0;
 		loop->linkedmemops=0;
 
+		//--- overlay selection: which guest registers live in fixed host
+		//registers across the whole region -------------------------------
+		//
+		//census: per-register access counts. Elements of multi-reg params the
+		//allocator does NOT explode are context-accessed by their emitters
+		//(reg_aofs paths) and must never be overlaid.
+		u32 gcnt[sh4_reg_count];
+		u32 fcnt[16];
+		bool fforbid[16];
+		memset(gcnt,0,sizeof(gcnt));
+		memset(fcnt,0,sizeof(fcnt));
+		memset(fforbid,0,sizeof(fforbid));
+
+		for (auto& kv : blocks)
+		{
+			RuntimeBlockInfo* m=kv.second;
+			for (size_t i=0;i<m->oplist.size();i++)
+			{
+				shil_opcode* op=&m->oplist[i];
+				const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+				for (int pi=0;pi<5;pi++)
+				{
+					const shil_param& p=*prms[pi];
+					if (!p.is_reg())
+						continue;
+
+					if (p.count()==1)
+					{
+						if (p.is_r32i())
+						{
+							if (p._reg<sh4_reg_count)
+								gcnt[p._reg]++;
+						}
+						else if (p._reg>=reg_fr_0 && p._reg<=reg_fr_15)
+							fcnt[p._reg-reg_fr_0]++;
+					}
+					else
+					{
+						//mirror arm_reg_alloc::ExplodeVec
+						bool explode=false;
+						if (p.count()==4 && (op->op==shop_ftrv || op->op==shop_fipr))
+							explode=true;
+						if (p.is_r64f() &&
+							(op->op==shop_mov64 || op->op==shop_readm || op->op==shop_writem || op->op==shop_fsca))
+							explode=true;
+
+						for (u32 e=0;e<p.count();e++)
+						{
+							u32 fr_elem=p._reg+e;
+							if (fr_elem>=reg_fr_0 && fr_elem<=reg_fr_15)
+							{
+								if (explode)
+									fcnt[fr_elem-reg_fr_0]++;
+								else
+									fforbid[fr_elem-reg_fr_0]=true;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		//candidates: plain gprs + sr.T. Other i32 regs (fpul etc) stay off
+		//until their emitter paths are audited for direct context writes.
+		struct ov_cand { u32 key; u32 score; };
+		std::vector<ov_cand> gcand;
+		for (int i=0;i<16;i++)
+			if (gcnt[reg_r0+i])
+				gcand.push_back({(u32)(reg_r0+i),gcnt[reg_r0+i]});
+		if (gcnt[reg_sr_T])
+			gcand.push_back({(u32)reg_sr_T,gcnt[reg_sr_T]});
+
+		//fpu: pair-aligned (even guest pair -> even host pair) so 64-bit
+		//moves keep a valid d-reg view of overlaid halves
+		std::vector<ov_cand> fcand;
+		for (u32 i=0;i<16;i+=2)
+			if ((fcnt[i]+fcnt[i+1]) && !fforbid[i] && !fforbid[i+1])
+				fcand.push_back({i,fcnt[i]+fcnt[i+1]});
+
+		auto by_score=[](const ov_cand& a,const ov_cand& b){ return a.score>b.score; };
+		std::sort(gcand.begin(),gcand.end(),by_score);
+		std::sort(fcand.begin(),fcand.end(),by_score);
+
+		//iterative fit: every op must still find span-pool room for all its
+		//non-overlaid operands (the emitters have no memory fallback)
+		u32 n_ov_g=(u32)std::min<size_t>(3,gcand.size());
+		u32 n_ov_f=(u32)std::min<size_t>(4,fcand.size());	//pairs
+
+		auto is_ov_g=[&](u32 greg)->bool
+		{
+			for (u32 i=0;i<n_ov_g;i++)
+				if (gcand[i].key==greg) return true;
+			return false;
+		};
+		auto is_ov_f=[&](u32 fidx)->bool
+		{
+			for (u32 i=0;i<n_ov_f;i++)
+				if (fidx==fcand[i].key || fidx==fcand[i].key+1) return true;
+			return false;
+		};
+
+		for (bool retry=true; retry; )
+		{
+			retry=false;
+
+			for (auto& kv : blocks)
+			{
+				RuntimeBlockInfo* m=kv.second;
+
+				bool m_vec=false;
+				for (size_t i=0;i<m->oplist.size();i++)
+					if (m->oplist[i].op==shop_ftrv || m->oplist[i].op==shop_fipr)
+						{ m_vec=true; break; }
+
+				u32 gpool=5-n_ov_g;
+				u32 fpool=(m_vec?12:16)-n_ov_f*2;
+
+				for (size_t i=0;i<m->oplist.size() && !retry;i++)
+				{
+					shil_opcode* op=&m->oplist[i];
+					const shil_param* prms[5]={&op->rd,&op->rd2,&op->rs1,&op->rs2,&op->rs3};
+
+					u32 gdem=0,fdem=0;
+					u32 gseen[8],fseen[16];
+
+					for (int pi=0;pi<5;pi++)
+					{
+						const shil_param& p=*prms[pi];
+						if (!p.is_reg())
+							continue;
+
+						if (p.count()==1 && p.is_r32i())
+						{
+							if (is_ov_g(p._reg)) continue;
+							bool dup=false;
+							for (u32 si=0;si<gdem;si++) if (gseen[si]==(u32)p._reg) dup=true;
+							if (!dup && gdem<8) gseen[gdem++]=p._reg;
+						}
+						else
+						{
+							bool explode = (p.count()==1) ||
+								(p.count()==4 && (op->op==shop_ftrv || op->op==shop_fipr)) ||
+								(p.is_r64f() && (op->op==shop_mov64 || op->op==shop_readm || op->op==shop_writem || op->op==shop_fsca));
+							if (!explode)
+								continue;	//context-accessed, no pool use
+
+							for (u32 e=0;e<p.count();e++)
+							{
+								u32 fr_elem=p._reg+e;
+								if (fr_elem<reg_fr_0 || fr_elem>reg_fr_15) continue;
+								if (is_ov_f(fr_elem-reg_fr_0)) continue;
+								bool dup=false;
+								for (u32 si=0;si<fdem;si++) if (fseen[si]==fr_elem) dup=true;
+								if (!dup && fdem<16) fseen[fdem++]=fr_elem;
+							}
+						}
+					}
+
+					if (gdem>gpool && n_ov_g>0) { n_ov_g--; retry=true; }
+					if (fdem>fpool && n_ov_f>0) { n_ov_f--; retry=true; }
+				}
+
+				if (retry) break;
+			}
+		}
+
+		//apply the selection: gpr hosts from the tail of the pool (spans keep
+		//the head), fpu host pairs from the head (spans keep a contiguous,
+		//pair-aligned tail)
+		reg.OverlayClear();
+		loop_ov_gpr.clear();
+		loop_ov_fpu.clear();
+
+		static const eReg g_hosts[3]={r11,r10,r7};
+		for (u32 i=0;i<n_ov_g;i++)
+		{
+			reg.OverlaySetg((Sh4RegType)gcand[i].key,g_hosts[i]);
+			loop_ov_gpr.push_back(std::make_pair(gcand[i].key,g_hosts[i]));
+		}
+
+		for (u32 i=0;i<n_ov_f;i++)
+		{
+			eFSReg lo=(eFSReg)(f16+i*2);
+			reg.OverlaySetf((Sh4RegType)(reg_fr_0+fcand[i].key),lo);
+			reg.OverlaySetf((Sh4RegType)(reg_fr_0+fcand[i].key+1),(eFSReg)(lo+1));
+			loop_ov_fpu.push_back(std::make_pair((u32)(reg_fr_0+fcand[i].key),lo));
+			loop_ov_fpu.push_back(std::make_pair((u32)(reg_fr_0+fcand[i].key+1),(eFSReg)(lo+1)));
+		}
+
+		//reduced pools for the per-member span allocation
+		eReg loop_regs[6];
+		{
+			u32 n=0;
+			for (const eReg* p=alloc_regs;*p!=(eReg)-1;p++)
+			{
+				bool used=false;
+				for (u32 i=0;i<n_ov_g;i++)
+					if (g_hosts[i]==*p) used=true;
+				if (!used)
+					loop_regs[n++]=*p;
+			}
+			loop_regs[n]=(eReg)-1;
+		}
+
+		eFSReg loop_fpu[17];
+		eFSReg loop_fpu_temps[13];
+		{
+			u32 n=0;
+			for (const eFSReg* p=alloc_fpu;*p!=(eFSReg)-1;p++)
+				if (*p>=(eFSReg)(f16+n_ov_f*2))
+					loop_fpu[n++]=*p;
+			loop_fpu[n]=(eFSReg)-1;
+
+			n=0;
+			for (const eFSReg* p=alloc_fpu_temps;*p!=(eFSReg)-1;p++)
+				if (*p>=(eFSReg)(f16+n_ov_f*2))
+					loop_fpu_temps[n++]=*p;
+			loop_fpu_temps[n]=(eFSReg)-1;
+		}
+
+		loop_exit_jumps.clear();
+		loop_emitting=true;
+
 		loop->code=(DynarecCodeEntryPtr)EMIT_GET_PTR();
 		u8* blk_start=(u8*)EMIT_GET_PTR();
+
+		//preamble: bring the overlaid set into its hosts. Entry is only ever
+		//through the head (FPCA); the back edge re-enters below this point.
+		emit_overlay_fill(nullptr);
 
 		std::map<u32, u32> mpos;                //member addr -> emitted host addr
 		std::vector<loop_edge_fixup> fixups;    //forward branches to patch
@@ -2982,7 +3270,7 @@ struct Arm32NGenBackend: NGenBackend
 				xmtrx_resident=false;
 
 				reg.block_loops=false;
-				reg.DoAlloc(m,alloc_regs,fpu_temps_avail?alloc_fpu_temps:alloc_fpu);
+				reg.DoAlloc(m,loop_regs,fpu_temps_avail?loop_fpu_temps:loop_fpu);
 				reg.OpBegin(&m->oplist[0],0);
 
 				for (size_t i=0;i<m->oplist.size();i++)
@@ -2992,7 +3280,17 @@ struct Arm32NGenBackend: NGenBackend
 					if (i!=0)
 						reg.OpBegin(op,i);
 
+					//ifb-class ops run guest state through the context; the
+					//overlaid set spills before and refreshes after (canonical
+					//ops get the same bracket via the CC_Start/CC_Finish hooks)
+					bool sync_op = op->op==shop_ifb || op->op==shop_sync_sr || op->op==shop_sync_fpscr;
+					if (sync_op)
+						emit_overlay_spill();
+
 					ngen_compile_opcode(m,op,false,true);
+
+					if (sync_op)
+						emit_overlay_fill(nullptr);
 
 					if (xmtrx_resident && op_kills_xmtrx(op))
 						xmtrx_resident=false;
@@ -3017,6 +3315,21 @@ struct Arm32NGenBackend: NGenBackend
 			emit_ptr=0;
 		}
 
+		//shared exit epilogue: commit the overlaid set, then dispatch on r4
+		u32 epi=(u32)EMIT_GET_PTR();
+		emit_overlay_spill();
+		emit_fpca_jump();
+
+		for (auto slot : loop_exit_jumps)
+		{
+			verify(emit_ptr==0);
+			emit_ptr=slot;
+			JUMP(epi);
+			verify(emit_ptr==slot+1);
+			emit_ptr=0;
+		}
+		loop_exit_jumps.clear();
+
 		//point the never-used relink area at a pad inside the block, so a
 		//stray Relink() cannot write over the next block in the cache
 		loop->relink_offset=(u8*)EMIT_GET_PTR()-(u8*)loop->code;
@@ -3040,8 +3353,21 @@ struct Arm32NGenBackend: NGenBackend
 		bool doLock = !bm_RamPageHasData(loop->addr, loop->sh4_code_size);
 		bm_AddBlock(loop, doLock);
 
-		printf("CompileLoop: %08X..%08X, %zu members, %d bytes host code\n",
-			loop->addr, span_end, blocks.size(), loop->host_code_size);
+		printf("CompileLoop: %08X..%08X, %zu members, %d bytes host code, overlay %u gpr + %u fpu\n",
+			loop->addr, span_end, blocks.size(), loop->host_code_size,
+			n_ov_g, n_ov_f*2);
+		for (u32 i=0;i<n_ov_g;i++)
+			printf("  ov gpr guest#%d (%u uses) -> host r%d\n", gcand[i].key, gcand[i].score, (int)g_hosts[i]);
+		for (u32 i=0;i<n_ov_f;i++)
+			printf("  ov fpu fr%d/fr%d (%u uses) -> host s%d/s%d\n",
+				fcand[i].key, fcand[i].key+1, fcand[i].score, (int)(f16+i*2), (int)(f16+i*2+1));
+
+		//the overlay only applies inside this region; normal Compile() must
+		//never see it
+		loop_emitting=false;
+		reg.OverlayClear();
+		loop_ov_gpr.clear();
+		loop_ov_fpu.clear();
 	}
 
 	void OnResetBlocks()
@@ -3313,9 +3639,14 @@ struct Arm32NGenBackend: NGenBackend
 		return true;
 	}
 
-	void CC_Start(shil_opcode* op) 
-	{ 
+	void CC_Start(shil_opcode* op)
+	{
 		CC_pars.clear();
+
+		//in a loop region, a canonical op may reach guest registers through
+		//the context (ptr args); commit the overlaid set first
+		if (loop_emitting)
+			emit_overlay_spill();
 	}
 	void CC_Param(shil_opcode* op,shil_param* par,CanonicalParamType tp) 
 	{ 
@@ -3436,9 +3767,15 @@ struct Arm32NGenBackend: NGenBackend
 		CALL((u32)function);
 	}
 
-	void CC_Finish(shil_opcode* op) 
-	{ 
-		CC_pars.clear(); 
+	void CC_Finish(shil_opcode* op)
+	{
+		CC_pars.clear();
+
+		//the op may have written guest registers through the context; refresh
+		//the overlaid set (minus the op's own dests, which are freshest in
+		//their mapped hosts)
+		if (loop_emitting)
+			emit_overlay_fill(op);
 	}
 };
 

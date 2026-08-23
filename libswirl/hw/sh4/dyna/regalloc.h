@@ -263,6 +263,40 @@ struct RegAlloc
 	//spans CarriedNeedsFlush() names before it branches back.
 	bool block_loops=false;
 
+	//--- overlay: cross-block resident registers, managed by the region
+	//compiler (CompileLoop) above the span machinery. Overlaid registers are
+	//invisible to the span builder (InsertRegs skips their accesses) and the
+	//alloc queries resolve them first; the region compiler emits their
+	//preloads/writebacks itself (region preamble, shared exit epilogue, and
+	//spill/restore brackets around ifb/canonical ops that reach the context
+	//behind the allocator's back). The table is region-constant for now; the
+	//design allows per-label tables plus edge moves later.
+	bool overlay_active=false;
+	u32 overlay_gpr[sh4_reg_count];
+	u32 overlay_fpu[sh4_reg_count];
+
+	void OverlayClear()
+	{
+		overlay_active=false;
+		for (int i=0;i<sh4_reg_count;i++)
+			overlay_gpr[i]=overlay_fpu[i]=0xFFFFFFFF;
+	}
+
+	void OverlaySetg(Sh4RegType reg, nreg_t nreg)
+	{
+		overlay_gpr[reg]=(u32)nreg;
+		overlay_active=true;
+	}
+
+	void OverlaySetf(Sh4RegType reg, nregf_t nreg)
+	{
+		overlay_fpu[reg]=(u32)nreg;
+		overlay_active=true;
+	}
+
+	bool IsOverlaidg(Sh4RegType reg) { return overlay_active && overlay_gpr[reg]!=0xFFFFFFFF; }
+	bool IsOverlaidf(Sh4RegType reg) { return overlay_active && overlay_fpu[reg]!=0xFFFFFFFF; }
+
 	u32 current_opid;
 	u32 block_last;		//index of the block's last op
 	u32 preload_fpu,preload_gpr;
@@ -293,6 +327,9 @@ struct RegAlloc
 
 	bool IsAllocg(Sh4RegType reg)
 	{
+		if (IsOverlaidg(reg))
+			return true;
+
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
 			if (all_spans[sid]->regstart==(u32)reg && all_spans[sid]->contains(current_opid))
@@ -317,6 +354,9 @@ struct RegAlloc
 
 	bool IsAllocf(Sh4RegType reg)
 	{
+		if (IsOverlaidf(reg))
+			return true;
+
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
 			if (all_spans[sid]->regstart==(u32)reg && all_spans[sid]->contains(current_opid))
@@ -347,6 +387,9 @@ struct RegAlloc
 	nreg_t mapg(Sh4RegType reg)
 	{
 		verify(IsAllocg(reg));
+
+		if (IsOverlaidg(reg))
+			return (nreg_t)overlay_gpr[reg];
 
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
@@ -381,6 +424,9 @@ struct RegAlloc
 	nregf_t mapf(Sh4RegType reg)
 	{
 		verify(IsAllocf(reg));
+
+		if (IsOverlaidf(reg))
+			return (nregf_t)overlay_fpu[reg];
 
 		for (u32 sid=0;sid<all_spans.size();sid++)
 		{
@@ -467,6 +513,16 @@ struct RegAlloc
 
 		if (!explode)
 		{
+			//overlaid registers are invisible to the span machinery; the
+			//region compiler owns their residency. (multi-reg params that do
+			//not explode access the context directly - the region compiler
+			//never overlays their elements, see the census in CompileLoop)
+			if (overlay_active && regs.is_reg() && regs.count()==1)
+			{
+				if (regs.is_r32i() ? IsOverlaidg(regs._reg) : IsOverlaidf(regs._reg))
+					return;
+			}
+
 			l.insert(regs);
 		}
 		else
@@ -478,6 +534,9 @@ struct RegAlloc
 				shil_param p=regs;
 				p.type=FMT_F32;
 				p._reg=(Sh4RegType)(p._reg+i);
+
+				if (overlay_active && IsOverlaidf(p._reg))
+					continue;
 
 				l.insert(p);
 			}
@@ -572,7 +631,13 @@ struct RegAlloc
 			bool placeable=true;
 			bool preload=false;
 
+			//overlaid elements have no spans (the region compiler owns their
+			//residency), so an operand touching any cannot take a host run
 			for (u32 e=0;e<prm.count();e++)
+				if (IsOverlaidf((Sh4RegType)(prm._reg+e)))
+					placeable=false;
+
+			for (u32 e=0;e<prm.count() && placeable;e++)
 			{
 				el[e]=FindSpan((Sh4RegType)(prm._reg+e),opid);
 
@@ -1185,7 +1250,10 @@ struct RegAlloc
 				(
 				(block->oplist[opid].rd.is_r32i() && block->oplist[opid].rs1.is_r32i() ) ||
 				(block->oplist[opid].rd.is_r32f() && block->oplist[opid].rs1.is_r32f() )
-				))
+				) &&
+				//overlaid regs have no spans and never alias
+				!IsOverlaidg(block->oplist[opid].rd._reg)  && !IsOverlaidf(block->oplist[opid].rd._reg) &&
+				!IsOverlaidg(block->oplist[opid].rs1._reg) && !IsOverlaidf(block->oplist[opid].rs1._reg))
 			{
 				RegSpan* x=FindSpan(block->oplist[opid].rs1._reg,(u32)opid);
 				RegSpan* d=FindSpan(block->oplist[opid].rd._reg,(u32)opid);
