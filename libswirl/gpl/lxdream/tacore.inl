@@ -50,6 +50,7 @@ static u8* pvr2_main_ram_hidden;
  * duplicated here.
  */
 #define TACORE_VRAM_BANK_BIT 0x400000
+#define TA_BANK_MASK  (TACORE_VRAM_BANK_BIT - 1)
 static inline uint32_t pvr_map32_inl(uint32_t offset32) {
     //64b wide bus is achieved by interleaving the banks every 32 bits
     const uint32_t static_bits = (VRAM_MASK - (TACORE_VRAM_BANK_BIT * 2 - 1)) | 3;
@@ -505,7 +506,8 @@ static void ta_bad_input_error() {
  * @param length Number of 32-bit words to write.
  * @return number of words actually written
  */
-static int ta_write_polygon_buffer( uint32_t *data, int length )
+__attribute__((noinline, cold))
+static int ta_write_polygon_buffer_slow( uint32_t *data, int length )
 {
     int rv;
     int posn = TA_ISP_CURRENT;// MMIO_READ( PVR2, TA_POLYPOS );
@@ -535,6 +537,27 @@ static int ta_write_polygon_buffer( uint32_t *data, int length )
     TA_ISP_CURRENT = posn;
     //MMIO_WRITE( PVR2, TA_POLYPOS, posn );
     return rv;
+}
+
+
+static inline int ta_write_polygon_buffer(uint32_t *data, int length)
+{
+    uint32_t posn = TA_ISP_CURRENT;
+    uint32_t gap  = TA_ISP_LIMIT - posn;
+    uint32_t n    = (uint32_t)length;
+
+    if (__builtin_expect((gap >> 2) >= n &&
+                         (posn & TA_BANK_MASK) + n * 4 <= TACORE_VRAM_BANK_BIT, 1)) {
+        /* posn is 4-aligned, so pvr_map32_inl collapses to two ops */
+        uint32_t *dst = &PVRRAM( posn );
+
+        for (uint32_t i = 0; i < n; i++)
+            dst[i * 2] = data[i];
+
+        TA_ISP_CURRENT = posn + n * 4;
+        return (int)n;
+    }
+    return ta_write_polygon_buffer_slow(data,length);
 }
 
 #define TA_NO_ALLOC 0xFFFFFFFF
