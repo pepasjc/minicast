@@ -60,6 +60,12 @@ struct RuntimeBlockInfo: RuntimeBlockInfo_Core
 	// backwards-only cycle check must not treat it as provably forward.
 	bool static_from_constprop;
 
+	// QACR0 area captured when the block compiled (first execution): region
+	// formation happens much later from rdv_DoInterrupts, where the live
+	// QACR routinely points elsewhere, so sq_pref_multiblock promotes the
+	// 0x1338 TA fastpath on this snapshot instead
+	u8 qacr0_area;
+
 	// op 0's regalloc preloads are emitted before the smc/cycle-check code;
 	// this range lets the shop map attribute them (per-shop profiling only)
 	u16 host_preload0;

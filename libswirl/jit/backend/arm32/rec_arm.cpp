@@ -16,12 +16,21 @@
 #include "hw/sh4/sh4_mmr.h"
 #include "hw/sh4/sh4_rom.h"
 #include "hw/sh4/sh4_interrupts.h"
+// pvr headers must precede sh4_core.h - its register macros (r, sr, ...)
+// would mangle their declarations
+#include "hw/pvr/pvr_mem.h"   // TAWriteSQ_MTTA (0x1338 pref fastpath)
+#include "hw/pvr/ta_ring.h"   // ta_ring layout for the inline SQ->TA push
 #include "hw/sh4/sh4_core.h"
 #include "hw/sh4/dyna/ngen.h"
 #include "hw/sh4/dyna/perf_map.h"
 #include "hw/sh4/sh4_mem.h"
 
 #include "ngen_arm.h"
+
+// ta.cpp: the TA parser FSM table (ta_fsm[2048] is ta_cur_state) and the
+// rare-transition handler; both reached directly by the 0x1338 pref fastpath.
+extern u8 ta_fsm[2049];
+void DYNACALL ta_handle_cmd(u32 trans, void* block);
 
 /*
 
@@ -277,6 +286,10 @@ eFSReg alloc_fpu_temps[]={f16,f17,f18,f19,f20,f21,f22,f23,
 
 bool fpu_temps_avail;	//f28-f31 are backend scratch for this block
 bool xmtrx_resident;	//s0-s15 currently hold xf0-xf15
+
+//ctx offset of the xmtrx, same value ftrv's rs2.reg_aofs() yields; a full
+//reload is SUB(r2,r8,xmtrx_aofs()) + VLDM(d0,r2,8)
+static u32 xmtrx_aofs() { return shil_param(regv_xmtrx).reg_aofs(); }
 
 struct arm_reg_alloc: RegAlloc<eReg,eFSReg,false>
 {
@@ -2082,26 +2095,151 @@ void ngen_compile_opcode(RuntimeBlockInfo* block, shil_opcode* op, bool staging,
 	
 		case shop_pref:
 			{
-				if (op->flags != 0x1337)
-				{
-					LSR(r1,reg.mapg(op->rs1),26);
-					MOV(r0,reg.mapg(op->rs1));
-					CMP(r1,0x38);
-				}
-				else
-					MOV(r0,reg.mapg(op->rs1));
-
 				auto sh4mmr = sh4_cpu->sh4mmr.get();
 
-				if (CCN_MMUCR.AT)
-				{
-					CALL((unat)&do_sqw_mmu,op->flags==0x1337?CC_AL:CC_EQ);
-				}
-				else
-				{	
+				if (op->flags == 0x1338 && !CCN_MMUCR.AT) {
+					// Region-marked TA pref: inline the TAWriteSQ_MTTA fastpath
+					// (ta_thd_data32_i: ring push + FSM step). The 0x1338 mark is
+					// speculative - sq_pref_multiblock sampled QACR at compile
+					// time - so revalidate at runtime: the fastpath only runs
+					// while do_sqw_nommu still points at TAWriteSQ_MTTA and the
+					// SQ lands in the TA poly FIFO. QACR moved / YUV / vram
+					// window / full ring all take the original call, which also
+					// covers the full-ring wfe spin. r2 stays = do_sqw_nommu on
+					// every guard-exit path so the slow tail can blx it directly.
+					eReg addr=reg.mapg(op->rs1);
+
 					LDR(r2,r8,rcb_noffs(&do_sqw_nommu));
+					MOV32(r3,(u32)&TAWriteSQ_MTTA);
+					CMP(r2,r3);
+					u32* to_slow_a=(u32*)EMIT_GET_PTR(); NOP();
+					// address_w = addr&0x1FFFFFF, TA poly iff < 0x800000
+					TST(addr,0x1800000);
+					u32* to_slow_b=(u32*)EMIT_GET_PTR(); NOP();
+
+					MOV32(r14,(u32)&ta_ring);
+					LDR(r0,r14,offsetof(ta_ring_t,write_priv));
+					LDR(r1,r14,offsetof(ta_ring_t,read_cache));
+					SUB(r1,r0,r1);
+					CMP(r1,TA_RING_BLOCKS);
+					u32* to_slow_c=(u32*)EMIT_GET_PTR(); NOP();
+
+					// r1 = &sq_both[addr&0x20], the 32-byte block to push
+					AND(r1,addr,0x20);
+					ADD(r1,r1,r8);
+					SUB(r1,r1,-rcb_noffs(sq_both));
+					// r12 = &ta_ring.data[(wr & TA_RING_MASK) * TA_RING_BLOCK]
+					UBFX(r12,r0,0,__builtin_ctz(TA_RING_BLOCKS));
+					ADD(r12,r14,r12,__builtin_ctz(TA_RING_BLOCK),false);
+					ADD(r12,r12,offsetof(ta_ring_t,data));
+					// write_priv is producer-private: safe to bump before the
+					// copy, the consumer only sees write_pub
+					ADD(r0,r0,1);
+					STR(r0,r14,offsetof(ta_ring_t,write_priv));
+					LDRD(r2,r1,0);  STRD(r2,r12,0);
+					LDRD(r2,r1,8);  STRD(r2,r12,8);
+					LDRD(r2,r1,16); STRD(r2,r12,16);
+					LDRD(r2,r1,24); STRD(r2,r12,24);
+					// publish on a batch boundary (dmb orders the copies before
+					// the index store; sev wakes a parked consumer)
+					TST(r0,TA_RING_BATCH-1);
+					B(16-8,CC_NE);          //skip the 3-insn publish body
+					DMB();
+					STR(r0,r14,offsetof(ta_ring_t,write_pub));
+					SEV();
+
+					// FSM step: state_in = (cur<<8)|(ParaType<<5)|((obj_ctrl>>2)&31)
+					LDR(r2,r1);             //pcw
+					MOV32(r14,(u32)ta_fsm);
+					LDRB(r0,r14,2048);      //ta_cur_state
+					UBFX(r3,r2,2,5);
+					ORR(r3,r3,r0,false,S_LSL,8);
+					UBFX(r0,r2,29,3);
+					ORR(r3,r3,r0,false,S_LSL,5);
+					LDRB(r12,r14,r3,Offset,true);
+					STRB(r12,r14,2048);     //ta_cur_state = trans (full byte, as in C)
+					TST(r12,0xF0);
+					u32* to_handle=(u32*)EMIT_GET_PTR(); NOP();
+					u32* to_end_a=(u32*)EMIT_GET_PTR(); NOP();
+
+					u32 slow=(u32)EMIT_GET_PTR();
+					MOV(r0,addr);
 					SUB(r1,r8,-rcb_noffs(sq_both));
-					BLX(r2,op->flags==0x1337?CC_AL:CC_EQ);
+					BLX(r2);
+					//the C side owns the caller-saved vfp bank: bring the
+					//matrix back before rejoining code that assumes it
+					if (xmtrx_resident)
+					{
+						SUB(r2,r8,xmtrx_aofs());
+						VLDM(d0,r2,8);
+					}
+					u32* to_end_b=(u32*)EMIT_GET_PTR(); NOP();
+
+					u32 handle=(u32)EMIT_GET_PTR();
+					MOV(r0,r12);            //trans
+					// r1 is still the sq block from the fastpath
+					CALL((unat)&ta_handle_cmd);
+					if (xmtrx_resident)
+					{
+						SUB(r2,r8,xmtrx_aofs());
+						VLDM(d0,r2,8);
+					}
+
+					u32 end=(u32)EMIT_GET_PTR();
+					verify(emit_ptr==0);
+					emit_ptr=to_slow_a; JUMP(slow,CC_NE);   verify(emit_ptr==to_slow_a+1);
+					emit_ptr=to_slow_b; JUMP(slow,CC_NE);   verify(emit_ptr==to_slow_b+1);
+					emit_ptr=to_slow_c; JUMP(slow,CC_HS);   verify(emit_ptr==to_slow_c+1);
+					emit_ptr=to_handle; JUMP(handle,CC_NE); verify(emit_ptr==to_handle+1);
+					emit_ptr=to_end_a;  JUMP(end);          verify(emit_ptr==to_end_a+1);
+					emit_ptr=to_end_b;  JUMP(end);          verify(emit_ptr==to_end_b+1);
+					emit_ptr=0;
+				} else if (op->flags == 0x1338) {
+					// 0x1338 under MMU: treat as a plain marked SQ pref
+					MOV(r0,reg.mapg(op->rs1));
+					CALL((unat)&do_sqw_mmu);
+					if (xmtrx_resident)
+					{
+						SUB(r2,r8,xmtrx_aofs());
+						VLDM(d0,r2,8);
+					}
+				} else {
+					if (op->flags != 0x1337)
+					{
+						LSR(r1,reg.mapg(op->rs1),26);
+						MOV(r0,reg.mapg(op->rs1));
+						CMP(r1,0x38);
+					}
+					else
+						MOV(r0,reg.mapg(op->rs1));
+
+					if (CCN_MMUCR.AT)
+					{
+						CALL((unat)&do_sqw_mmu,op->flags==0x1337?CC_AL:CC_EQ);
+					}
+					else
+					{
+						LDR(r2,r8,rcb_noffs(&do_sqw_nommu));
+						SUB(r1,r8,-rcb_noffs(sq_both));
+						BLX(r2,op->flags==0x1337?CC_AL:CC_EQ);
+					}
+
+					//the call owns the caller-saved vfp bank; bring the matrix
+					//back so prefs never kill residency. Unmarked prefs re-test
+					//the SQ range (the call trashed the flags) so a plain data
+					//prefetch skips the 16 loads
+					if (xmtrx_resident)
+					{
+						ConditionCode reload_cc=CC_AL;
+						if (op->flags!=0x1337)
+						{
+							LSR(r1,reg.mapg(op->rs1),26);
+							CMP(r1,0x38);
+							reload_cc=CC_EQ;
+						}
+						SUB(r2,r8,xmtrx_aofs(),reload_cc);
+						VLDM(d0,r2,8,0,reload_cc);
+					}
 				}
 			}
 			break;
@@ -2392,7 +2530,7 @@ __default:
 //Any memory access that could ever fault must kill: ngen_Rewrite may turn
 //its fastpath into a handler call at any time, and handlers clobber the
 //caller-saved vfp bank.
-static bool op_kills_xmtrx(shil_opcode* op)
+static bool op_kills_xmtrx(shil_opcode* op, bool in_loop=false)
 {
 	//a write into the back bank changes the matrix itself
 	const shil_param* wr[2]={&op->rd,&op->rd2};
@@ -2427,6 +2565,11 @@ static bool op_kills_xmtrx(shil_opcode* op)
 		return false;
 
 	case shop_readm:
+		//in regions memops are assumed to never rewrite into a handler
+		//call (perf experiment: loop bases are ram; a rewrite would
+		//silently corrupt the resident matrix)
+		if (in_loop)
+			return false;
 		//imm reads from ram are plain host loads and can never fault;
 		//imm mmio reads call the handler, reg-address reads may be
 		//rewritten into one later
@@ -2436,11 +2579,20 @@ static bool op_kills_xmtrx(shil_opcode* op)
 			_vmem_read_const(op->rs1._imm,isram,memop_bytes(memop_type(op)));
 			return !isram;
 		}
-		return true;
+		return memop_type(op) != SZ_64F;
 
 	case shop_writem:
+		if (in_loop)
+			return false;
 		//sq-marked stores hit the context inline and can never fault
 		return op->flags2!=0x1337;
+
+	case shop_pref:
+		//never kills: the 0x1338 inline TA fastpath stays off the vfp bank
+		//and reloads in its call-out tails; the 0x1337/unmarked paths
+		//reload after their call (unmarked re-tests the SQ range so plain
+		//data prefetches skip it) - all gated on xmtrx_resident at emit
+		return false;
 
 	default:
 		//pref/ifb/sync_sr/sync_fpscr/frswap/fsca/canonical fallbacks:
@@ -2971,6 +3123,38 @@ struct Arm32NGenBackend: NGenBackend
 			guest_cyc+=m->guest_cycles;
 		}
 
+		//--- region-wide xmtrx residency ---------------------------------
+		//if the region transforms with the matrix and nothing in it can
+		//clobber s0-s15 (memops are assumed rewrite-free inside regions,
+		//and the 0x1338 pref reloads after its own call-outs), load it
+		//once in the preamble and every ftrv skips its column loads -
+		//including across members and around the back edge
+		bool loop_xmtrx=false;
+		{
+			bool has_ftrv=false;
+			for (auto& kv : blocks)
+				for (auto& lop : kv.second->oplist)
+					if (lop.op==shop_ftrv)
+						has_ftrv=true;
+
+			if (has_ftrv)
+			{
+				u32 nkills=0;
+				for (auto& kv : blocks)
+					for (auto& lop : kv.second->oplist)
+						if (op_kills_xmtrx(&lop,true))
+						{
+							if (!nkills++)
+								printf("CompileLoop %08X: xmtrx NOT hoisted, killed by:\n",blocks.begin()->first);
+							printf("  %08X+%02X: %s\n",kv.first,lop.guest_offs,lop.dissasm().c_str());
+						}
+
+				loop_xmtrx=!nkills;
+				if (loop_xmtrx)
+					printf("CompileLoop %08X: xmtrx hoisted to preamble\n",blocks.begin()->first);
+			}
+		}
+
 		DynaRBI* loop=(DynaRBI*)AllocateBlock();
 
 		//no Setup(): that would re-decode. Fill what the blockmanager and the
@@ -3117,7 +3301,9 @@ struct Arm32NGenBackend: NGenBackend
 						{ m_vec=true; break; }
 
 				u32 gpool=5-n_ov_g;
-				u32 fpool=(m_vec?12:16)-n_ov_f*2;
+				//a hoisted matrix forces every member onto the temps pool
+				//(scratch has to stay out of s0-s15), so size against it
+				u32 fpool=((m_vec||loop_xmtrx)?12:16)-n_ov_f*2;
 
 				for (size_t i=0;i<m->oplist.size() && !retry;i++)
 				{
@@ -3232,6 +3418,15 @@ struct Arm32NGenBackend: NGenBackend
 		//through the head (FPCA); the back edge re-enters below this point.
 		emit_overlay_fill(nullptr);
 
+		//hoisted matrix: one load per region entry, resident for the whole
+		//stay (the back edge never passes through here again, and nothing
+		//inside the region kills it - see the prescan)
+		if (loop_xmtrx)
+		{
+			SUB(r2,r8,xmtrx_aofs());
+			VLDM(d0,r2,8);
+		}
+
 		std::map<u32, u32> mpos;                //member addr -> emitted host addr
 		std::vector<loop_edge_fixup> fixups;    //forward branches to patch
 
@@ -3269,7 +3464,10 @@ struct Arm32NGenBackend: NGenBackend
 						break;
 					}
 				}
-				xmtrx_resident=false;
+				//a resident matrix forces every member's scratch out of
+				//s0-s15, so all of them run on the temps pool
+				fpu_temps_avail|=loop_xmtrx;
+				xmtrx_resident=loop_xmtrx;
 
 				reg.block_loops=false;
 				reg.DoAlloc(m,loop_regs,fpu_temps_avail?loop_fpu_temps:loop_fpu);
@@ -3294,8 +3492,13 @@ struct Arm32NGenBackend: NGenBackend
 					if (sync_op)
 						emit_overlay_fill(nullptr);
 
-					if (xmtrx_resident && op_kills_xmtrx(op))
+					if (xmtrx_resident && op_kills_xmtrx(op,true))
+					{
+						//with a hoisted matrix this must never fire - the
+						//prescan proved the region kill-free
+						verify(!loop_xmtrx);
 						xmtrx_resident=false;
+					}
 
 					reg.OpEnd(op);
 				}

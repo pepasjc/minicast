@@ -480,6 +480,7 @@ u32 DYNACALL rdv_DoInterrupts(void* block_cpde)
 				// cross-block SQ marking over the member set: the stores and
 				// their pref live in different members (delay-slot prefs),
 				// which the per-block matcher cannot see
+				// TODO: This is crashy crashy with JGR
 				sq_pref_multiblock(loop);
 
 				// build the growth-probe record BEFORE the compile: it

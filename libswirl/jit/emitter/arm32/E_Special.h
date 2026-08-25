@@ -31,6 +31,12 @@ namespace ARM
 		EMIT_I;
 	}
 
+	EAPI SEV()
+	{
+		DECL_Id(0xE320F004);
+		EMIT_I;
+	}
+
 	EAPI SVC(u32 code)
 	{
 		DECL_Id(0x0F000000);

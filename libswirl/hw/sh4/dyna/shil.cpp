@@ -17,7 +17,7 @@
 #include "blockmanager.h"
 
 
-#define printf_sqwm(...) 
+#define printf_sqwm(...) printf(__VA_ARGS__)
 
 u32 RegisterWrite[sh4_reg_count];
 u32 RegisterRead[sh4_reg_count];
@@ -1712,6 +1712,7 @@ static bool anchor_succs(RuntimeBlockInfo* rbi, RuntimeBlockInfo* succ[2])
 	fragments' code is already emitted, and a fragment recompile rebuilds
 	its oplist from scratch.
 */
+extern u32 CCN_QACR_TR[2];
 void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks)
 {
 	if (!settings.dynarec.opt_sqw_on_pref)
@@ -1788,8 +1789,21 @@ void sq_pref_multiblock(std::map<u32, RuntimeBlockInfo*>& blocks)
 					op.flags2=0x1337;
 					marked++;
 				}
-				if (op.op==shop_pref && op.rs1.is_r32i() && (u32)op.rs1._reg==rt)
-					op.flags=0x1337;
+				if (op.op==shop_pref && op.rs1.is_r32i() && (u32)op.rs1._reg==rt) {
+					// This is way to aggressive and needs to be validated before loop entry
+					// use the QACR0 area captured when this block compiled
+					// (first execution) - the live value here, mid region
+					// formation, routinely points elsewhere
+					u32 qacr_area = kv.second->qacr0_area;
+					if (qacr_area == 4 && settings.pvr.MultithreadedTA) {
+						op.flags=0x1338;
+						printf_sqwm("sq_pref_multiblock: pref base guest#%u promoted to 0x1338 (TA fastpath)\n", rt);
+					} else {
+						op.flags=0x1337;
+						printf_sqwm("sq_pref_multiblock: pref base guest#%u stays 0x1337: captured QACR0 area=%u (need 4), MultithreadedTA=%d\n",
+							rt, qacr_area, (int)settings.pvr.MultithreadedTA);
+					}
+				}
 			}
 		}
 
@@ -2027,6 +2041,10 @@ void AnalyseBlock(RuntimeBlockInfo* blk)
 		ftrv_known_w(blk);
 	}
 #endif
+
+	//snapshot the SQ routing as it stands while this code actually runs;
+	//CCN_QACR_TR stores (area<<26)-0xE0000000, undo the bias
+	blk->qacr0_area = (u8)(((CCN_QACR_TR[0] + 0xE0000000) >> 26) & 7);
 
 	bool anchor = false;
 	if (settings.dynarec.opt_sqw_on_pref) {
