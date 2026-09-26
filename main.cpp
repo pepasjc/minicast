@@ -54,8 +54,47 @@ void do_vram_dump(u8* vram, u8* pvr_regs) {
 	}
 }
 
+#include "hw/sh4/sh4_mem.h"   // SaveRomFiles
+#include <signal.h>
+#include <pthread.h>
+#include "stdclass.h"
+
+// The fast exits below (_exit on ESC / mapped Exit, SIGTERM from the
+// launcher) skip the normal teardown, which is what writes the Dreamcast
+// flash (BIOS settings: language, audio mode, ...) back to dc_nvmem.bin.
+static void save_before_exit()
+{
+	// same directory LoadRomFiles reads (libswirl.cpp), where dc_nvmem.bin
+	// takes precedence over dc_flash.bin on the next boot
+	SaveRomFiles("/media/fat/games/Dreamcast/");
+	fflush(stdout);
+	sync();
+}
+
+// SIGTERM is blocked in every thread and taken here synchronously, so the
+// save runs in a normal thread context, not inside a signal handler.
+static void* sigterm_thread(void* arg)
+{
+	sigset_t* set = (sigset_t*)arg;
+	int sig = 0;
+	if (sigwait(set, &sig) == 0) {
+		printf("minicast: SIGTERM, saving flash and exiting%c", 10);
+		fflush(stdout);
+		save_before_exit();
+		_exit(0);
+	}
+	return nullptr;
+}
+
 int main(int argc, char* argv[])
 {
+	static sigset_t term_set;
+	sigemptyset(&term_set);
+	sigaddset(&term_set, SIGTERM);
+	pthread_sigmask(SIG_BLOCK, &term_set, nullptr);
+	pthread_t term_thread;
+	pthread_create(&term_thread, nullptr, sigterm_thread, &term_set);
+
 	#if HOST_OS == OS_LINUX
 	void common_linux_setup();
 	common_linux_setup();
@@ -403,6 +442,15 @@ static bool decode_mapping(const char* text, InMapping* m) {
 // linux-dist frontends that normally feed these globals are compiled out).
 
 #include "hw/maple/maple_devs.h"   // MDT_* device types
+#include "hw/sh4/sh4_mem.h"         // SaveRomFiles
+
+// The exit keys below leave via _exit(), skipping the teardown that writes
+// the Dreamcast flash back - save it first so BIOS settings (language,
+// stereo/mono, ...) persist. Same folder LoadRomFiles reads it from.
+static void save_flash_before_exit() {
+	SaveRomFiles("/media/fat/games/Dreamcast/");
+	sync();
+}
 
 extern u8 kb_key[6];      // DC keyboard matrix: up to 6 held keys (HID codes)
 extern u8 kb_shift;       // DC keyboard modifier bitmask (HID byte)
@@ -794,6 +842,7 @@ static void evdev_read_pad(EvdevPad& p) {
 			if (ev[e].type == EV_KEY && ev[e].code == KEY_ESC && ev[e].value == 1) {
 				printf("evdev: ESC pressed on %s, exiting\n", p.path.c_str());
 				fflush(stdout);
+				save_before_exit();
 				_exit(0); // Ungraceful termination
 			}
 			if (ev[e].type == EV_KEY && ev[e].code == KEY_0 && ev[e].value == 1) {
@@ -829,6 +878,7 @@ static void evdev_update() {
 		if (p.held[TGT_BTN_EXIT] && !p.actPrev[0]) {
 			printf("evdev: exit button pressed on %s, exiting\n", p.path.c_str());
 			fflush(stdout);
+			save_before_exit();
 			_exit(0); // Ungraceful termination, as the hardcoded ESC
 		}
 		if (p.held[TGT_BTN_SCREENSHOT] && !p.actPrev[1])
