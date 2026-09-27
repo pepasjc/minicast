@@ -208,7 +208,7 @@ void mem_Reset(SuperH4* sh4, bool Manual)
 void mem_Term(SuperH4* sh4)
 {
 	//write back Flash/SRAM
-	SaveRomFiles(get_writable_data_path(DATA_PATH));
+	SaveRomFiles("/media/fat/games/Dreamcast/");
 	
 	//mem_b.Term(); // handled by vmem
 
