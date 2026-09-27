@@ -570,6 +570,7 @@ struct EvdevPad {
 	bool kpNeg[2], kpPos[2];   // keypair halves per analog axis
 	bool relDriven[2];         // analog axis fed by rel (mouse) motion
 	float relAccum[2];         // motion accumulator, decays in tick
+	bool synDropped;           // SYN_DROPPED seen: skip to SYN_REPORT, then resync
 };
 
 static bool g_evdev_mode = false;   // any [inputN] section in emu.cfg
@@ -698,6 +699,7 @@ static void evdev_init() {
 		pad.ffEffect = -1;
 		pad.feedKb = false;
 		pad.feedMouse = false;
+		pad.synDropped = false;
 		if (it != cfgpads.end()) {
 			// known device: if its port carries a maple keyboard/mouse
 			// (Peripherals page), its events feed that device's state
@@ -824,6 +826,39 @@ static void evdev_tick(EvdevPad& p) {
 	}
 }
 
+// After SYN_DROPPED the kernel has thrown events away (the client buffer
+// overflowed while the game wasn't polling, e.g. during menu loads), so the
+// state built from the event stream can hold a press whose release was lost:
+// a "latched" direction that keeps a menu scrolling by itself. Re-read the
+// real state of every mapped key and axis.
+static void evdev_resync(EvdevPad& p) {
+	unsigned char keys[KEY_MAX / 8 + 1];
+	memset(keys, 0, sizeof(keys));
+	if (ioctl(p.fd, EVIOCGKEY(sizeof(keys)), keys) >= 0) {
+		for (int t = 0; t < TGT_COUNT; t++) {
+			const InMapping& m = p.map[t];
+			int codes[2] = { -1, -1 };
+			if (m.kind == InMapping::KEY)
+				codes[0] = m.code;
+			else if (m.kind == InMapping::KEYPAIR) {
+				codes[0] = m.neg;
+				codes[1] = m.pos;
+			}
+			for (int c : codes)
+				if (c >= 0 && c <= KEY_MAX)
+					evdev_feed(p, EV_KEY, c, (keys[c / 8] >> (c % 8)) & 1);
+		}
+	}
+	for (int t = 0; t < TGT_COUNT; t++) {
+		const InMapping& m = p.map[t];
+		if (m.kind == InMapping::ABS && m.code >= 0 && m.code < ABS_CODES) {
+			struct input_absinfo ai;
+			if (ioctl(p.fd, EVIOCGABS(m.code), &ai) == 0)
+				evdev_feed(p, EV_ABS, m.code, ai.value);
+		}
+	}
+}
+
 static void evdev_read_pad(EvdevPad& p) {
 	if (p.fd < 0)
 		return;
@@ -839,6 +874,19 @@ static void evdev_read_pad(EvdevPad& p) {
 			break;
 		}
 		for (ssize_t e = 0; e < n / (ssize_t)sizeof(ev[0]); e++) {
+			if (ev[e].type == EV_SYN && ev[e].code == SYN_DROPPED) {
+				if (!p.synDropped)
+					printf("evdev: events dropped on %s, resyncing\n", p.path.c_str());
+				p.synDropped = true;
+				continue;
+			}
+			if (p.synDropped) {
+				if (ev[e].type == EV_SYN && ev[e].code == SYN_REPORT) {
+					p.synDropped = false;
+					evdev_resync(p);
+				}
+				continue;
+			}
 			if (ev[e].type == EV_KEY && ev[e].code == KEY_ESC && ev[e].value == 1) {
 				printf("evdev: ESC pressed on %s, exiting\n", p.path.c_str());
 				fflush(stdout);
