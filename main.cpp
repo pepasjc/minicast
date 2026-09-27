@@ -549,6 +549,8 @@ static void dc_mouse_input(u16 type, u16 code, s32 value) {
 #define EVDEV_REL_GAIN       4.0f  // mouse counts -> analog deflection
 #define ABS_CODES            64    // ABS_MAX + 1
 
+static int hid_shadow_open(const std::string& evpath);
+
 struct EvdevPad {
 	int fd;
 	std::string path, id;
@@ -571,6 +573,9 @@ struct EvdevPad {
 	bool relDriven[2];         // analog axis fed by rel (mouse) motion
 	float relAccum[2];         // motion accumulator, decays in tick
 	bool synDropped;           // SYN_DROPPED seen: skip to SYN_REPORT, then resync
+	int hidFd;                 // hidraw node of the same device (GET_REPORT), -1 = none
+	uint64_t lastEventNs;      // last key/abs event read from evdev
+	uint64_t lastCheckedSample;// shadow sample seq already compared
 };
 
 static bool g_evdev_mode = false;   // any [inputN] section in emu.cfg
@@ -700,6 +705,9 @@ static void evdev_init() {
 		pad.feedKb = false;
 		pad.feedMouse = false;
 		pad.synDropped = false;
+		pad.hidFd = -1;
+		pad.lastEventNs = 0;
+		pad.lastCheckedSample = 0;
 		if (it != cfgpads.end()) {
 			// known device: if its port carries a maple keyboard/mouse
 			// (Peripherals page), its events feed that device's state
@@ -726,6 +734,8 @@ static void evdev_init() {
 					pad.relDriven[t - TGT_ANALOG_X] = m.kind == InMapping::REL;
 			}
 		}
+		if (mapped)
+			pad.hidFd = hid_shadow_open(paths[i]);
 		// drain events queued before we started
 		struct input_event drain[16];
 		while (read(fd, drain, sizeof(drain)) > 0)
@@ -826,6 +836,105 @@ static void evdev_tick(EvdevPad& p) {
 	}
 }
 
+// ---- device-state shadow (lost USB reports) ------------------------------
+// Full-speed sticks behind the DE10's high-speed hub use split transactions;
+// under heavy DDR/CPU load the dwc2 host occasionally loses an interrupt IN
+// report the hub already acknowledged. Sticks that only report on change
+// (GP2040-CE) then leave a press or release missing until the next change:
+// a menu keeps scrolling, a press is ignored. A helper thread re-reads the
+// input report over the control pipe (HIDIOCGINPUT, retried by the hub) and
+// evdev_update repairs mapped keys when the event stream has been quiet.
+#include <linux/hidraw.h>
+#include <atomic>
+#include <dirent.h>
+#ifndef HIDIOCGINPUT    /* Linux 5.11+, newer than the toolchain headers */
+#define HIDIOCGINPUT(len) _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x0A, len)
+#endif
+
+static const int HID_SHADOW_MAX = 8;
+struct HidShadow {
+	int fd = -1;
+	std::atomic<uint32_t> buttons{0};    // bit n = HID button n+1
+	std::atomic<uint64_t> sampleNs{0};   // when buttons was read
+	std::atomic<uint64_t> seq{0};
+};
+static HidShadow g_hid_shadow[HID_SHADOW_MAX];
+static int g_hid_shadow_count = 0;
+static std::atomic<bool> g_hid_thread_started{false};
+
+static uint64_t mono_ns() {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// GP2040-CE "Generic" report: 32 one-bit buttons first, no report id
+static const unsigned char GP2040_DESC_PREFIX[] = {
+	0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x20,
+	0x15, 0x00, 0x25, 0x01, 0x95, 0x20, 0x75, 0x01, 0x81, 0x02 };
+
+// hidraw node of the HID device behind /dev/input/eventN, if its report
+// layout is the known 32-button one; returns a shadow slot or -1
+static int hid_shadow_open(const std::string& evpath) {
+	if (g_hid_shadow_count >= HID_SHADOW_MAX)
+		return -1;
+	std::string ev = evpath.substr(evpath.rfind('/') + 1);
+	std::string dir = "/sys/class/input/" + ev + "/device/../../hidraw";
+	DIR* d = opendir(dir.c_str());
+	if (!d)
+		return -1;
+	std::string node;
+	while (struct dirent* e = readdir(d))
+		if (!strncmp(e->d_name, "hidraw", 6))
+			node = std::string("/dev/") + e->d_name;
+	closedir(d);
+	if (node.empty())
+		return -1;
+	int fd = open(node.c_str(), O_RDWR);
+	if (fd < 0)
+		return -1;
+	int dsz = 0;
+	struct hidraw_report_descriptor rd;
+	if (ioctl(fd, HIDIOCGRDESCSIZE, &dsz) < 0 || dsz < (int)sizeof(GP2040_DESC_PREFIX)) {
+		close(fd);
+		return -1;
+	}
+	rd.size = dsz;
+	if (ioctl(fd, HIDIOCGRDESC, &rd) < 0 ||
+		memcmp(rd.value, GP2040_DESC_PREFIX, sizeof(GP2040_DESC_PREFIX))) {
+		close(fd);
+		return -1;
+	}
+	int slot = g_hid_shadow_count++;
+	g_hid_shadow[slot].fd = fd;
+	printf("evdev: %s shadowed by %s (GET_REPORT resync)""\n", evpath.c_str(), node.c_str());
+	return slot;
+}
+
+static void* hid_shadow_thread(void*) {
+	for (;;) {
+		for (int i = 0; i < g_hid_shadow_count; i++) {
+			HidShadow& h = g_hid_shadow[i];
+			unsigned char buf[64];
+			memset(buf, 0, sizeof(buf));
+			uint64_t t = mono_ns();
+			int n = ioctl(h.fd, HIDIOCGINPUT(sizeof(buf)), buf);
+			if (n >= 5) {       // [0] report id (0), [1..4] buttons
+				uint32_t b = buf[1] | (buf[2] << 8) | (buf[3] << 16) | ((uint32_t)buf[4] << 24);
+				h.buttons.store(b);
+				h.sampleNs.store(t);
+				h.seq.fetch_add(1);
+			}
+		}
+		usleep(50000);
+	}
+}
+
+// evdev code the kernel (hid-input, gamepad usage) gives HID button n (1-based)
+static int hid_button_code(int n) {
+	return n <= 16 ? BTN_GAMEPAD + (n - 1) : BTN_TRIGGER_HAPPY + (n - 17);
+}
+
 // After SYN_DROPPED the kernel has thrown events away (the client buffer
 // overflowed while the game wasn't polling, e.g. during menu loads), so the
 // state built from the event stream can hold a press whose release was lost:
@@ -901,7 +1010,56 @@ static void evdev_read_pad(EvdevPad& p) {
 				// vblank (rend_vblank -> ScreenshotVBlank -> spg_screenshot)
 				QueueScreenshot();
 			}
+			if (ev[e].type == EV_KEY || ev[e].type == EV_ABS)
+				p.lastEventNs = mono_ns();
 			evdev_feed(p, ev[e].type, ev[e].code, ev[e].value);
+		}
+	}
+}
+
+// Compare mapped keys with the device's own report; only when the report was
+// sampled after the last evdev event (so it is the newer truth) and the
+// stream has been quiet a moment (no report still in flight).
+static void evdev_hid_repair(EvdevPad& p) {
+	if (p.hidFd < 0)
+		return;
+	HidShadow& h = g_hid_shadow[p.hidFd];
+	uint64_t seq = h.seq.load();
+	if (seq == p.lastCheckedSample)
+		return;
+	uint64_t sample = h.sampleNs.load();
+	uint32_t b = h.buttons.load();
+	if (sample < p.lastEventNs + 30000000ULL || mono_ns() - p.lastEventNs < 60000000ULL)
+		return;                                   // stream newer / still active
+	p.lastCheckedSample = seq;
+	for (int t = 0; t < TGT_COUNT; t++) {
+		const InMapping& m = p.map[t];
+		int codes[2] = { -1, -1 };
+		if (m.kind == InMapping::KEY)
+			codes[0] = m.code;
+		else if (m.kind == InMapping::KEYPAIR) {
+			codes[0] = m.neg;
+			codes[1] = m.pos;
+		}
+		for (int c : codes) {
+			if (c < 0)
+				continue;
+			int n = c >= BTN_TRIGGER_HAPPY ? c - BTN_TRIGGER_HAPPY + 17 : c - BTN_GAMEPAD + 1;
+			if (n < 1 || n > 32 || hid_button_code(n) != c)
+				continue;
+			bool dev = (b >> (n - 1)) & 1;
+			bool cur;
+			if (m.kind == InMapping::KEYPAIR)
+				cur = (c == m.neg) ? p.kpNeg[t - TGT_ANALOG_X] : p.kpPos[t - TGT_ANALOG_X];
+			else if (t == TGT_TRIG_L || t == TGT_TRIG_R)
+				cur = p.trig[t - TGT_TRIG_L] != 0;
+			else
+				cur = p.held[t];
+			if (dev != cur) {
+				printf("evdev: %s code %d %s, resync from device""\n", p.path.c_str(), c,
+				       dev ? "pressed" : "released");
+				evdev_feed(p, EV_KEY, c, dev);
+			}
 		}
 	}
 }
@@ -919,6 +1077,7 @@ static void evdev_update() {
 		evdev_read_pad(p);
 		if (p.fd < 0)
 			continue;
+		evdev_hid_repair(p);
 		evdev_tick(p);
 
 		// mapped emulator actions, on the PRESS edge (in addition to the
@@ -994,6 +1153,13 @@ void UpdateInputState(u32 port) {
 	if (!evdev_inited) {
 		evdev_inited = true;
 		evdev_init();
+		if (g_hid_shadow_count && !g_hid_thread_started.exchange(true)) {
+			pthread_t th;   // plain pthreads like the rest of minicast
+			if (pthread_create(&th, nullptr, hid_shadow_thread, nullptr) == 0)
+				pthread_detach(th);
+			else
+				printf("evdev: GET_REPORT resync thread failed""\n");
+		}
 	}
 	if (g_evdev_mode) {
 		evdev_update();   // refreshes all four ports
