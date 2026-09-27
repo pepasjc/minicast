@@ -641,7 +641,7 @@ struct Dreamcast_impl : VirtualDreamcast {
 
             sh4_cpu->Run();
 
-            SaveRomFiles(get_writable_data_path(DATA_PATH));
+            SaveRomFiles("/media/fat/games/Dreamcast/");
             if (reset_requested)
             {
                 virtualDreamcast->Reset();
