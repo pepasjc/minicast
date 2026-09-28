@@ -14,6 +14,19 @@
 //     cheats, speed controls) yet, so hardcore=1 in the cfg is ignored
 //   - dry run (MINICAST_RA_DRYRUN=1 / dreamster_dryrun=1): achievement and
 //     leaderboard submissions are logged and answered locally, never sent
+//
+// /media/fat/retroachievements.cfg keys read (the file is never written):
+//   username, password    login (no username: RA off, silently)
+//   hardcore              ignored (logged): softcore only
+//   debug=1               verbose rcheevos + HTTP logging
+//   dreamster_dryrun=1    see above
+//   dreamster_frame_source=vblank|render   what drives rc_client_do_frame
+//   dreamster_chime_volume=0..100          default 70
+//   dreamster_chime_test=1                 play the chime when the game loads
+// Environment (wins over the cfg): MINICAST_RA=0 (off), MINICAST_RA_DRYRUN,
+// MINICAST_RA_DEBUG, MINICAST_RA_FRAME, MINICAST_RA_CHIME_VOLUME,
+// MINICAST_RA_CHIME_TEST, and for tests MINICAST_RA_CFG / _WAV /
+// _UNLOCK_LOG / _CURL (alternate paths).
 
 #include "ra_dc.h"
 #include "ra_http.h"
@@ -171,6 +184,8 @@ static int load_config(void)
 			g_cfg.frame_source = parse_frame_source(val);
 		else if (!strcasecmp(key, "dreamster_chime_volume"))
 			g_cfg.chime_volume = atoi(val);
+		else if (!strcasecmp(key, "dreamster_chime_test"))
+			g_cfg.chime_test = atoi(val);
 	}
 	fclose(f);
 
@@ -721,7 +736,7 @@ static void RC_CCONV load_game_callback(int result, const char* error_message, r
 
 	g_game_loaded = 1;
 	if (g_cfg.chime_test) {
-		ra_log("chime test (MINICAST_RA_CHIME_TEST)");
+		ra_log("chime test (dreamster_chime_test / MINICAST_RA_CHIME_TEST)");
 		play_chime();
 	}
 	// start evaluating: from now on the SH4 thread signals every frame
