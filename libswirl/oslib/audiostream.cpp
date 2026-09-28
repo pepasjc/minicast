@@ -307,6 +307,22 @@ struct AudioStream_Mister : AudioStream {
 	SoundFrame Status[4] = { { 0 } };
 	float current_partial_pos = 0;
 
+	// Dynamic rate control. With LimitFPS the emulator is paced by this
+	// FIFO blocking when full, which only works while the emulation keeps up:
+	// at 95% speed the AICA makes 5% fewer samples than the I2S side plays,
+	// the 2048-entry FIFO (~43 ms) runs dry and every frame then crackles.
+	// So once the FIFO drops below DRC_KNEE, emit proportionally more output
+	// points per input sample (up to DRC_MAX more): the audio slows down a
+	// little with the game instead of breaking up, and the FIFO settles at a
+	// level where the stretch matches the shortfall. At full speed the level
+	// sits above the knee and nothing changes. The level is read once per
+	// DRC_PERIOD input samples (one uncached MMIO read) and smoothed.
+	static constexpr u32   DRC_KNEE   = 1536;
+	static constexpr float DRC_MAX    = 0.15f;
+	static constexpr u32   DRC_PERIOD = 32;
+	float drc_rate = 1.0f;       // output points per input, relative to 48/44.1
+	u32 drc_count = 0;
+
 	void WriteSample(s16 r, s16 l)
 	{
 		if (!polly2_mmio)
@@ -320,7 +336,17 @@ struct AudioStream_Mister : AudioStream {
 		Status[3].l = l;
 		Status[3].r = r;
 
-		const float inc = 44100.0f / 48000.0f;
+		if (wait && ++drc_count >= DRC_PERIOD)
+		{
+			drc_count = 0;
+			u32 level = polly2_audio_level();
+			float want = 1.0f;
+			if (level < DRC_KNEE)
+				want += DRC_MAX * (float)(DRC_KNEE - level) / DRC_KNEE;
+			drc_rate += (want - drc_rate) * 0.05f;
+		}
+
+		const float inc = (44100.0f / 48000.0f) / drc_rate;
 		while (current_partial_pos < 1)
 		{
 			SoundFrame res = {
