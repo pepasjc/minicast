@@ -378,6 +378,7 @@ int kbhit(void) {
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <glob.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <string>
@@ -550,10 +551,16 @@ static void dc_mouse_input(u16 type, u16 code, s32 value) {
 #define ABS_CODES            64    // ABS_MAX + 1
 
 static int hid_shadow_open(const std::string& evpath);
+static void hid_shadow_close(int slot);
+static uint64_t mono_ns();
 
 struct EvdevPad {
 	int fd;
 	std::string path, id;
+	std::string baseId;        // id without the #n suffix (rescan numbering)
+	dev_t rdev;                // node identity: a replaced node reuses the path
+	ino_t ino;
+	bool dead;                 // removed: fds closed, dropped by evdev_reap
 	int port;                  // maple port 0..3 this device feeds
 	bool feedKb;               // port carries a DC keyboard: feed kb_key/kb_shift
 	bool feedMouse;            // port carries a DC mouse: feed mo_*
@@ -609,10 +616,67 @@ static bool evdev_path_less(const std::string& a, const std::string& b) {
 	return evdev_path_num(a) < evdev_path_num(b);
 }
 
-static void evdev_init() {
-	// device id -> mappings, from [input0]..[inputN]
-	struct CfgPad { InMapping map[TGT_COUNT]; bool any; int port; };
-	std::map<std::string, CfgPad> cfgpads;
+// device id -> mappings, from [input0]..[inputN]; kept for hotplug rescans
+struct CfgPad { InMapping map[TGT_COUNT]; bool any; int port; };
+static std::map<std::string, CfgPad> g_cfgpads;
+
+// hotplug: /dev/input mtime the last scan saw, debounced by one poll period
+static struct timespec g_input_mtime_scanned, g_input_mtime_seen;
+static bool g_input_change_pending = false;
+static uint64_t g_hotplug_next_ns = 0;
+static bool g_evdev_any_dead = false;
+static const uint64_t HOTPLUG_POLL_NS = 500000000ULL;
+
+// A removed device: close its fds (the hidraw shadow is handed back to the
+// shadow thread, which owns its fd), release whatever it held on maple
+// keyboard/mouse state, and mark it for evdev_reap. Pad buttons/axes need
+// no release: evdev_update rebuilds all four ports from the live pads.
+static void evdev_remove_pad(EvdevPad& p, const char* why) {
+	if (p.dead)
+		return;
+	printf("evdev: lost %s [%s]%s\n", p.path.c_str(), p.id.c_str(), why);
+	if (p.fd >= 0)
+		close(p.fd);
+	p.fd = -1;
+	if (p.hidFd >= 0)
+		hid_shadow_close(p.hidFd);
+	p.hidFd = -1;
+	if (p.feedKb) {
+		memset(kb_key, 0, sizeof(kb_key));
+		kb_shift = 0;
+	}
+	if (p.feedMouse)
+		mo_buttons |= (1 << 1) | (1 << 2) | (1 << 3);
+	memset(p.held, 0, sizeof(p.held));
+	memset(p.analog, 0, sizeof(p.analog));
+	memset(p.trig, 0, sizeof(p.trig));
+	p.ffRumble = false;
+	p.dead = true;
+	g_evdev_any_dead = true;
+}
+
+// drop removed pads; only called outside any g_evdev_pads iteration (all
+// pad users - UpdateInputState / UpdateVibration - run on the maple thread)
+static void evdev_reap() {
+	if (!g_evdev_any_dead)
+		return;
+	g_evdev_any_dead = false;
+	for (size_t i = 0; i < g_evdev_pads.size(); ) {
+		if (g_evdev_pads[i].dead)
+			g_evdev_pads.erase(g_evdev_pads.begin() + i);
+		else
+			i++;
+	}
+}
+
+static bool evdev_id_live(const std::string& id) {
+	for (size_t i = 0; i < g_evdev_pads.size(); i++)
+		if (!g_evdev_pads[i].dead && g_evdev_pads[i].id == id)
+			return true;
+	return false;
+}
+
+static void evdev_load_cfg() {
 	for (int n = 0; ; n++) {
 		char section[32];
 		snprintf(section, sizeof(section), "input%d", n);
@@ -633,38 +697,31 @@ static void evdev_init() {
 			if (!val.empty() && decode_mapping(val.c_str(), &pad.map[t]))
 				pad.any = true;
 		}
-		cfgpads[devid] = pad;
+		g_cfgpads[devid] = pad;
 	}
+}
 
-	glob_t g;
-	if (glob("/dev/input/event*", 0, NULL, &g) != 0) {
-		printf("evdev: no /dev/input/event* devices\n");
-		return;
-	}
-	std::vector<std::string> paths(g.gl_pathv, g.gl_pathv + g.gl_pathc);
-	globfree(&g);
-	std::sort(paths.begin(), paths.end(), evdev_path_less);
+static std::string evdev_numbered_id(const std::string& base, int n) {
+	if (n <= 1)
+		return base;
+	char suffix[16];
+	snprintf(suffix, sizeof(suffix), "#%d", n);
+	return base + suffix;
+}
 
-	std::map<std::string, int> seen;
-	for (size_t i = 0; i < paths.size(); i++) {
-		int fd = open(paths[i].c_str(), O_RDONLY | O_NONBLOCK);
-		if (fd < 0)
-			continue;
-		std::string id = evdev_device_id(fd);
-		if (id.empty()) {
-			close(fd);
-			continue;
-		}
-		int dup = seen[id]++;
-		if (dup) {  // identical devices with no unique id
-			char suffix[16];
-			snprintf(suffix, sizeof(suffix), "#%d", dup + 1);
-			id += suffix;
-		}
+// Builds the EvdevPad for an event node already opened O_RDONLY (fd) whose
+// numbered DeviceId is `id`, and appends it to g_evdev_pads.
+static void evdev_add_pad(const std::string& path, int fd, const std::string& baseId,
+                          const std::string& id, bool hotplug) {
+	const char* hp = hotplug ? " (hotplug)" : "";
+	{
 		// unmatched devices stay open in monitor-only mode: no mappings,
 		// but the hardcoded ESC exit still watches them
-		std::map<std::string, CfgPad>::iterator it = cfgpads.find(id);
-		bool mapped = it != cfgpads.end() && it->second.any;
+		std::map<std::string, CfgPad>::iterator it = g_cfgpads.find(id);
+		bool mapped = it != g_cfgpads.end() && it->second.any;
+		struct stat st;
+		memset(&st, 0, sizeof(st));
+		fstat(fd, &st);
 
 		// rumble (purupuru pack): mapped controllers advertising FF_RUMBLE are
 		// reopened read-write so effects can be uploaded and played
@@ -675,7 +732,12 @@ static void evdev_init() {
 			if (ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbits)), ffbits) >= 0 &&
 				(ffbits[FF_RUMBLE / (8 * sizeof(unsigned long))] >>
 				 (FF_RUMBLE % (8 * sizeof(unsigned long)))) & 1) {
-				int rw = open(paths[i].c_str(), O_RDWR | O_NONBLOCK);
+				int rw = open(path.c_str(), O_RDWR | O_NONBLOCK);
+				struct stat rst;
+				if (rw >= 0 && (fstat(rw, &rst) != 0 || rst.st_rdev != st.st_rdev)) {
+					close(rw);   // node replaced in between: keep the first fd
+					rw = -1;
+				}
 				if (rw >= 0) {
 					close(fd);
 					fd = rw;
@@ -697,8 +759,12 @@ static void evdev_init() {
 		memset(&pad.relAccum, 0, sizeof(pad.relAccum));
 		memset(&pad.actPrev, 0, sizeof(pad.actPrev));
 		pad.fd = fd;
-		pad.path = paths[i];
+		pad.path = path;
 		pad.id = id;
+		pad.baseId = baseId;
+		pad.rdev = st.st_rdev;
+		pad.ino = st.st_ino;
+		pad.dead = false;
 		pad.port = 0;
 		pad.ffRumble = ffRumble;
 		pad.ffEffect = -1;
@@ -708,7 +774,7 @@ static void evdev_init() {
 		pad.hidFd = -1;
 		pad.lastEventNs = 0;
 		pad.lastCheckedSample = 0;
-		if (it != cfgpads.end()) {
+		if (it != g_cfgpads.end()) {
 			// known device: if its port carries a maple keyboard/mouse
 			// (Peripherals page), its events feed that device's state
 			pad.port = it->second.port;
@@ -735,23 +801,135 @@ static void evdev_init() {
 			}
 		}
 		if (mapped)
-			pad.hidFd = hid_shadow_open(paths[i]);
+			pad.hidFd = hid_shadow_open(path);
 		// drain events queued before we started
 		struct input_event drain[16];
 		while (read(fd, drain, sizeof(drain)) > 0)
 			;
 		g_evdev_pads.push_back(pad);
 		if (pad.feedKb || pad.feedMouse)
-			printf("evdev: mapped %s [%s] -> port %c (DC %s)\n",
+			printf("evdev: mapped %s [%s] -> port %c (DC %s)%s\n",
 				   pad.path.c_str(), id.c_str(), 'A' + pad.port,
-				   pad.feedKb ? "keyboard" : "mouse");
+				   pad.feedKb ? "keyboard" : "mouse", hp);
 		else if (mapped)
-			printf("evdev: mapped %s [%s] -> port %c%s\n",
+			printf("evdev: mapped %s [%s] -> port %c%s%s\n",
 				   pad.path.c_str(), id.c_str(), 'A' + pad.port,
-				   ffRumble ? ", rumble" : "");
+				   ffRumble ? ", rumble" : "", hp);
 		else
-			printf("evdev: monitoring %s [%s]\n", pad.path.c_str(), id.c_str());
+			printf("evdev: monitoring %s [%s]%s\n", pad.path.c_str(), id.c_str(), hp);
 	}
+}
+
+// Opens every /dev/input/event* node not already open. DeviceId #n numbering
+// runs over ALL nodes in numeric path order (already-open ones included), the
+// same rule as the launcher and the startup scan. On a rescan, an id that a
+// live pad already holds (e.g. identical pads, the lower-numbered one
+// replugged into a higher node) falls back to the lowest free #n so two
+// devices never share one [inputN] section.
+static void evdev_scan(bool hotplug) {
+	if (hotplug) {
+		// nodes removed or replaced since we opened them
+		for (size_t i = 0; i < g_evdev_pads.size(); i++) {
+			EvdevPad& p = g_evdev_pads[i];
+			struct stat st;
+			if (p.dead)
+				continue;
+			if (stat(p.path.c_str(), &st) != 0 || st.st_rdev != p.rdev || st.st_ino != p.ino)
+				evdev_remove_pad(p, " (node gone)");
+		}
+		evdev_reap();
+	}
+
+	glob_t g;
+	if (glob("/dev/input/event*", 0, NULL, &g) != 0) {
+		if (!hotplug)
+			printf("evdev: no /dev/input/event* devices\n");
+		return;
+	}
+	std::vector<std::string> paths(g.gl_pathv, g.gl_pathv + g.gl_pathc);
+	globfree(&g);
+	std::sort(paths.begin(), paths.end(), evdev_path_less);
+
+	std::map<std::string, int> seen;
+	for (size_t i = 0; i < paths.size(); i++) {
+		if (hotplug) {
+			struct stat st;
+			if (stat(paths[i].c_str(), &st) != 0)
+				continue;
+			const EvdevPad* have = nullptr;
+			for (size_t j = 0; j < g_evdev_pads.size() && !have; j++) {
+				const EvdevPad& p = g_evdev_pads[j];
+				if (p.path == paths[i] && p.rdev == st.st_rdev && p.ino == st.st_ino)
+					have = &p;
+			}
+			if (have) {   // already open: counts for the numbering only
+				seen[have->baseId]++;
+				continue;
+			}
+		}
+		int fd = open(paths[i].c_str(), O_RDONLY | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+		std::string base = evdev_device_id(fd);
+		if (base.empty()) {
+			close(fd);
+			continue;
+		}
+		// identical devices with no unique id get #2, #3, ...
+		int n = ++seen[base];
+		std::string id = evdev_numbered_id(base, n);
+		if (hotplug && evdev_id_live(id)) {
+			for (n = 1; evdev_id_live(evdev_numbered_id(base, n)); n++)
+				;
+			id = evdev_numbered_id(base, n);
+		}
+		evdev_add_pad(paths[i], fd, base, id, hotplug);
+	}
+}
+
+static void evdev_init() {
+	evdev_load_cfg();
+	// mtime before the glob: a node added in between changes it again, so
+	// the first hotplug poll catches it
+	struct stat st;
+	if (stat("/dev/input", &st) == 0)
+		g_input_mtime_scanned = st.st_mtim;
+	evdev_scan(false);
+	g_hotplug_next_ns = mono_ns() + HOTPLUG_POLL_NS;
+}
+
+// Cheap hotplug check from the input poll path: at most one stat() per
+// HOTPLUG_POLL_NS. A changed /dev/input mtime is only acted on once it has
+// stayed unchanged for a whole poll period: the directory has settled (a
+// DualSense adds several nodes in a row, the hidraw node the GET_REPORT
+// shadow needs comes right after the event node) and, the timestamp being
+// jiffy-coarse, no later change can share the mtime the scan is recorded
+// under.
+static bool timespec_eq(const struct timespec& a, const struct timespec& b) {
+	return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
+}
+
+static void evdev_hotplug_poll() {
+	evdev_reap();
+	uint64_t now = mono_ns();
+	if (now < g_hotplug_next_ns)
+		return;
+	g_hotplug_next_ns = now + HOTPLUG_POLL_NS;
+	struct stat st;
+	if (stat("/dev/input", &st) != 0)
+		return;   // devtmpfs drops the dir with its last node; reads see ENODEV
+	if (timespec_eq(st.st_mtim, g_input_mtime_scanned)) {
+		g_input_change_pending = false;
+		return;
+	}
+	if (!g_input_change_pending || !timespec_eq(st.st_mtim, g_input_mtime_seen)) {
+		g_input_change_pending = true;
+		g_input_mtime_seen = st.st_mtim;
+		return;
+	}
+	g_input_change_pending = false;
+	g_input_mtime_scanned = st.st_mtim;
+	evdev_scan(true);
 }
 
 static void evdev_feed(EvdevPad& p, u16 type, u16 code, s32 value) {
@@ -851,16 +1029,53 @@ static void evdev_tick(EvdevPad& p) {
 #define HIDIOCGINPUT(len) _IOC(_IOC_WRITE | _IOC_READ, 'H', 0x0A, len)
 #endif
 
+// Slot lifecycle (hotplug): FREE -> ACTIVE by the input thread (fd and the
+// sample fields are written while FREE, then published by the state store);
+// ACTIVE -> CLOSING by the input thread when the pad goes away; CLOSING ->
+// FREE by the shadow thread, which closes the fd itself. While a slot is
+// ACTIVE/CLOSING only the shadow thread uses its fd, so it is never closed
+// under a running ioctl and the number can't be reused behind its back.
 static const int HID_SHADOW_MAX = 8;
+enum { HS_FREE = 0, HS_ACTIVE, HS_CLOSING };
 struct HidShadow {
 	int fd = -1;
+	std::atomic<int> state{HS_FREE};
 	std::atomic<uint32_t> buttons{0};    // bit n = HID button n+1
 	std::atomic<uint64_t> sampleNs{0};   // when buttons was read
 	std::atomic<uint64_t> seq{0};
 };
 static HidShadow g_hid_shadow[HID_SHADOW_MAX];
-static int g_hid_shadow_count = 0;
 static std::atomic<bool> g_hid_thread_started{false};
+static bool g_hid_thread_running = false;   // input thread only
+
+static void* hid_shadow_thread(void*);
+
+static void hid_shadow_start_thread() {
+	if (g_hid_thread_started.exchange(true))
+		return;
+	pthread_t th;   // plain pthreads like the rest of minicast
+	if (pthread_create(&th, nullptr, hid_shadow_thread, nullptr) == 0) {
+		pthread_detach(th);
+		g_hid_thread_running = true;
+	} else
+		printf("evdev: GET_REPORT resync thread failed""\n");
+}
+
+// pad removed: hand the slot back (the shadow thread closes the fd)
+static void hid_shadow_close(int slot) {
+	if (slot < 0 || slot >= HID_SHADOW_MAX)
+		return;
+	HidShadow& h = g_hid_shadow[slot];
+	if (h.state.load() != HS_ACTIVE)
+		return;
+	if (g_hid_thread_running) {
+		h.state.store(HS_CLOSING);
+	} else {   // no thread ever touched it
+		close(h.fd);
+		h.fd = -1;
+		h.state.store(HS_FREE);
+	}
+}
 
 static uint64_t mono_ns() {
 	struct timespec ts;
@@ -876,7 +1091,11 @@ static const unsigned char GP2040_DESC_PREFIX[] = {
 // hidraw node of the HID device behind /dev/input/eventN, if its report
 // layout is the known 32-button one; returns a shadow slot or -1
 static int hid_shadow_open(const std::string& evpath) {
-	if (g_hid_shadow_count >= HID_SHADOW_MAX)
+	int slot = -1;
+	for (int i = 0; i < HID_SHADOW_MAX && slot < 0; i++)
+		if (g_hid_shadow[i].state.load() == HS_FREE)
+			slot = i;
+	if (slot < 0)
 		return -1;
 	std::string ev = evpath.substr(evpath.rfind('/') + 1);
 	std::string dir = "/sys/class/input/" + ev + "/device/../../hidraw";
@@ -905,16 +1124,30 @@ static int hid_shadow_open(const std::string& evpath) {
 		close(fd);
 		return -1;
 	}
-	int slot = g_hid_shadow_count++;
-	g_hid_shadow[slot].fd = fd;
+	HidShadow& h = g_hid_shadow[slot];
+	h.fd = fd;
+	h.buttons.store(0);     // a reused slot must not carry the old device's
+	h.sampleNs.store(0);    // sample (the new pad starts at lastEventNs 0)
+	h.seq.store(0);
+	h.state.store(HS_ACTIVE);
 	printf("evdev: %s shadowed by %s (GET_REPORT resync)""\n", evpath.c_str(), node.c_str());
+	hid_shadow_start_thread();
 	return slot;
 }
 
 static void* hid_shadow_thread(void*) {
 	for (;;) {
-		for (int i = 0; i < g_hid_shadow_count; i++) {
+		for (int i = 0; i < HID_SHADOW_MAX; i++) {
 			HidShadow& h = g_hid_shadow[i];
+			int st = h.state.load();
+			if (st == HS_CLOSING) {
+				close(h.fd);
+				h.fd = -1;
+				h.state.store(HS_FREE);
+				continue;
+			}
+			if (st != HS_ACTIVE)
+				continue;
 			unsigned char buf[64];
 			memset(buf, 0, sizeof(buf));
 			uint64_t t = mono_ns();
@@ -977,9 +1210,9 @@ static void evdev_read_pad(EvdevPad& p) {
 		if (n < (ssize_t)sizeof(ev[0])) {
 			if (n < 0 && (errno == EAGAIN || errno == EINTR))
 				break;
-			printf("evdev: lost %s [%s]\n", p.path.c_str(), p.id.c_str());
-			close(p.fd);
-			p.fd = -1;
+			// ENODEV (unplugged) or worse: closed and dropped at the next
+			// evdev_reap; a replug is picked up by the hotplug rescan
+			evdev_remove_pad(p, n < 0 && errno == ENODEV ? " (removed)" : "");
 			break;
 		}
 		for (ssize_t e = 0; e < n / (ssize_t)sizeof(ev[0]); e++) {
@@ -1152,15 +1385,9 @@ void UpdateInputState(u32 port) {
 	static bool evdev_inited = false;
 	if (!evdev_inited) {
 		evdev_inited = true;
-		evdev_init();
-		if (g_hid_shadow_count && !g_hid_thread_started.exchange(true)) {
-			pthread_t th;   // plain pthreads like the rest of minicast
-			if (pthread_create(&th, nullptr, hid_shadow_thread, nullptr) == 0)
-				pthread_detach(th);
-			else
-				printf("evdev: GET_REPORT resync thread failed""\n");
-		}
+		evdev_init();   // starts the GET_REPORT shadow thread if needed
 	}
+	evdev_hotplug_poll();   // reaps removed pads, opens new ones
 	if (g_evdev_mode) {
 		evdev_update();   // refreshes all four ports
 		return;
