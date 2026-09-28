@@ -47,6 +47,12 @@
 // consumer fed so it runs concurrently with the producer. Must be a power of two.
 #define TA_RING_BATCH    32
 
+// How far ahead of the write cursor ta_ring_push prefetches, in blocks. The
+// ring is far bigger than the L2, so every new cache line the producer writes
+// is a write-allocate miss that has to come from DDR; a few lines of lead
+// hide that even for back-to-back pushes (ta_vtx_data's DMA loop).
+#define TA_RING_PREFETCH 8
+
 // Register and control ops
 #define TA_RING_DECOUPLED_MAGIC 0xDEADBEEDCAFEBEBEULL
 #define TA_RING_DECOUPLED_OP_REGWRITE 0
@@ -121,6 +127,12 @@ static inline void ta_ring_push(const void* block)
 	}
 
 	memcpy(&ta_ring.data[(wr & TA_RING_MASK) * TA_RING_BLOCK], block, TA_RING_BLOCK);
+
+	// Pull a later slot's line in now so the copy that lands there doesn't
+	// stall on the line fill. Only a hint: it can't fault, and it is a plain
+	// coherent line fetch, so it changes nothing for the consumer even when
+	// the ring is nearly full and that slot hasn't been retired yet.
+	__builtin_prefetch(&ta_ring.data[((wr + TA_RING_PREFETCH) & TA_RING_MASK) * TA_RING_BLOCK], 1);
 
 	wr += 1;
 	ta_ring.write_priv = wr;
