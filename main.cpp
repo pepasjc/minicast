@@ -709,6 +709,25 @@ static std::string evdev_numbered_id(const std::string& base, int n) {
 	return base + suffix;
 }
 
+// Sensor side-nodes of modern pads (DualSense / DualShock 4 "Motion Sensors",
+// "Touchpad", ...): no controls, and a DualSense's motion node sends ~1000
+// events/s - monitoring it cost a read + SYN_DROPPED resync every frame on
+// the emulation thread. Left closed unless explicitly mapped (they still
+// count for the #N numbering, which the caller has done already).
+static bool evdev_noisy_node(int fd) {
+	char name[256];
+	memset(name, 0, sizeof(name));
+	if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0)
+		return false;
+	for (char* c = name; *c; c++)
+		*c = tolower((unsigned char)*c);
+	static const char* const parts[] = { "motion sensor", "touchpad", "accelerometer", "gyro" };
+	for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
+		if (strstr(name, parts[i]))
+			return true;
+	return false;
+}
+
 // Builds the EvdevPad for an event node already opened O_RDONLY (fd) whose
 // numbered DeviceId is `id`, and appends it to g_evdev_pads.
 static void evdev_add_pad(const std::string& path, int fd, const std::string& baseId,
@@ -719,6 +738,11 @@ static void evdev_add_pad(const std::string& path, int fd, const std::string& ba
 		// but the hardcoded ESC exit still watches them
 		std::map<std::string, CfgPad>::iterator it = g_cfgpads.find(id);
 		bool mapped = it != g_cfgpads.end() && it->second.any;
+		if (!mapped && evdev_noisy_node(fd)) {
+			printf("evdev: skipping sensor node %s [%s]%s\n", path.c_str(), id.c_str(), hp);
+			close(fd);
+			return;
+		}
 		struct stat st;
 		memset(&st, 0, sizeof(st));
 		fstat(fd, &st);
