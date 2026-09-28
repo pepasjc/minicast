@@ -3439,6 +3439,93 @@ struct Arm32NGenBackend: NGenBackend
 		CacheFlush((void*)sibling,(void*)(sibling+1));
 	}
 
+	//A store that faulted on a store queue address. Games fill the SQs with
+	//runs of plain stores through a pointer the static matcher can't prove
+	//(opt_sqw_on_pref is off, and loop-carried bases defeat it anyway), so the
+	//site is going to keep hitting the SQ. Turning it into the usual
+	//_vmem_WriteMem call costs a call, a register push/pop, a table lookup and
+	//(for doubles) a vfp->core transfer per store. Instead the fastpath's
+	//first slot becomes a branch to a fixup at the end of the code cache that
+	//checks the address the way _mem_hndl_SQ32 does and stores straight into
+	//sq_both, falling back to exactly the call the generic rewrite would have
+	//emitted for anything else:
+	//     lsr r1,raddr,#26 / cmp r1,#0x38
+	//     andeq r1,raddr,#0x3f / addeq r1,r1,r8 / (v)streq val,[r1,#sq_offs]
+	//     beq back
+	//     mov r0,raddr / val -> r1 or r3:r2 / bl _vmem_WriteMemXX / b back
+	//The sq path touches r1 and the flags only; the slow path clobbers what the
+	//generic rewrite's call clobbers.
+	static bool RewriteSQStore(arm_mem_op* ptr, s32 offs, eReg raddr, eReg rt, eFSReg ft, eFDReg fd, mem_op_type optp)
+	{
+		//the store sits at ptr[offs]; everything from ptr up to it is the
+		//address setup, which only writes r1
+		u32 back=(u32)(ptr+offs+1);
+		s32 sq_offs=rcb_noffs(sq_both);
+
+		verify(emit_ptr==0);
+
+		//keep the old behaviour when the cache is (nearly) out of room
+		if (emit_FreeSpace()<256)
+			return false;
+
+		u32 fixup=(u32)EMIT_GET_PTR();
+
+		snat lit=(snat)fixup-((snat)ptr+8);
+		if (lit<-33554432 || lit>33554428)
+			return false;
+
+		//vstr's offset is imm8 words, str's imm12 bytes
+		verify(sq_offs<0 && sq_offs>-1024 && (sq_offs&3)==0);
+
+		LSR(r1,raddr,26);
+		CMP(r1,0x38);
+		AND(r1,raddr,0x3F,CC_EQ);
+		ADD(r1,r1,r8,CC_EQ);
+
+		if (optp==SZ_32I)
+			STR(rt,r1,sq_offs,Offset,CC_EQ);
+		else if (optp==SZ_32F)
+			VSTR(ft,r1,sq_offs/4,CC_EQ);
+		else
+			VSTR(fd,r1,sq_offs/4,CC_EQ);
+
+		JUMP(back,CC_EQ);
+
+		//not the SQ: same as the generic rewrite (offs==1 goes through
+		//_mem_hndl, which is mov r0,raddr + _vmem_WriteMem32 as well)
+		if (optp==SZ_32I)
+			MOV(r1,rt);		//rt is never r1 (the fastpath's address) but may be r0
+
+		if (raddr!=r0)
+			MOV(r0,raddr);
+
+		if (optp==SZ_32F)
+			VMOV(r1,ft);
+		else if (optp==SZ_64F)
+		{
+			//staging register, or the callee-saved pair the operand lives in
+			verify(fd==d0 || (fd>=d8 && fd<=d15));
+			VMOV(r2,r3,fd);
+		}
+
+		CALL(optp==SZ_64F?(unat)_vmem_WriteMem64:(unat)_vmem_WriteMem32);
+		JUMP(back);
+
+		CacheFlush((void*)fixup,EMIT_GET_PTR());
+
+		//the fastpath: branch out of its first slot, the rest is dead
+		emit_ptr=(u32*)ptr;
+		JUMP(fixup);
+		for (s32 i=0;i<offs;i++)
+			NOP();
+		verify(emit_ptr==(u32*)back);
+		emit_ptr=0;
+
+		CacheFlush((void*)ptr,(void*)back);
+
+		return true;
+	}
+
 	bool Rewrite(rei_host_context_t* ctx)
 	{
 		arm_mem_op* ptr=(arm_mem_op*)ctx->pc;
@@ -3529,6 +3616,17 @@ struct Arm32NGenBackend: NGenBackend
 		
 		u8* sh4_ctr=(u8*)regs[8];
 		bool is_sq=(sh4_addr>>26)==0x38;
+
+		//SQ fills: checked inline store in a fixup (opt_sqw_rewrite keeps its
+		//own, unchecked, form below). Re-run from the address setup, which
+		//now branches to the fixup.
+		if (is_sq && !read && !settings.dynarec.opt_sqw_rewrite &&
+			(optp==SZ_32I || optp==SZ_32F || optp==SZ_64F) &&
+			RewriteSQStore(ptr,offs,raddr,rt,ft,fd,optp))
+		{
+			ctx->pc = (unat)ptr;
+			return true;
+		}
 
 		verify(emit_ptr==0);
 		emit_ptr=(u32*)ptr;
