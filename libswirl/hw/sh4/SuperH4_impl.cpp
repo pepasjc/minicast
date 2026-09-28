@@ -15,6 +15,7 @@
 #include "sh4_interrupts.h"
 
 #include "hw/pvr/pvr_mem.h" // for TAWriteSQ_STTA / TAWriteSQ_MTTA
+#include "oslib/audiostream.h" // audio_output_space
 
 #if HOST_OS == OS_LINUX
 #include <fcntl.h>
@@ -142,8 +143,11 @@ int UpdateSystem()
             compile_cycles = 0;
         }
 
-        // if buffer is nearly full, don't generate more audio / update timers
-        if (polly2_audio_space() < 128) {
+        // if buffer is nearly full, don't generate more audio / update timers.
+        // FIFO space minus what the threaded feeder still has queued, so the
+        // threshold means the same as with direct pushes and the ring never
+        // fills up enough to block the SH4 thread here.
+        if (audio_output_space() < 128) {
             freerun_last = freerun_now();
             return Sh4cntx.interrupt_pend | (sh4_int_bCpuRun == false);
         }

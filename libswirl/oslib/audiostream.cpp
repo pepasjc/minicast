@@ -298,6 +298,191 @@ void SortAudioBackends()
 
 
 #include "../../../polly2-rtl/driver/polly2_mmio.h"
+#include <atomic>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+
+/*
+	Threaded FIFO feeder ("audio", "threaded" = 1, the default)
+
+	Every AUDIO_DATA store goes uncached over the lightweight HPS-FPGA
+	bridge, and the SH4 thread used to eat that write latency ~48000
+	times a second inside AICA_Sample32. Now the SH4 thread only resamples
+	and drops the packed output words into this single-producer /
+	single-consumer ring; a helper thread on cpu0 moves them to the FIFO.
+
+	Producer (SH4 thread, cpu1): plain stores into data[] and a private
+	cursor; the cursor is published with one release store every
+	AUDIO_RING_PUBLISH samples (sub-batch leftovers go out with the next
+	AICA_Sample32 call, ~0.7ms later - the FIFO holds 42ms).
+
+	Consumer (audio thread, cpu0): every AUDIO_POLL_NS it loads write_pub
+	(acquire), reads the FIFO level once and pushes only what fits, so its
+	stores never stall; then retires them with a store to read_pub. It
+	never sleeps on the FIFO: sleeping 1ms between polls is what keeps it
+	off cpu0 (see below), and the 2048-deep FIFO covers that 40 times over.
+
+	Pacing: the old path was paced by the FIFO store stalling while the FIFO
+	was full. Now a full ring is the limiter: with LimitFPS the producer
+	futex-waits on read_pub until the consumer retires something (the
+	consumer only issues FUTEX_WAKE when prod_waiting is set, so it costs
+	nothing unless the emulator is ahead of realtime). Without LimitFPS a
+	full ring drops the sample, like the old `polly2_audio_space() > 1`
+	check. prod_waiting/read_pub use the Dekker pattern (seq_cst store,
+	then seq_cst load on each side) so a wake can't be lost; the futex
+	also has a 2ms timeout as a backstop.
+
+	cpu0 sharing: the TA consumer (tacore.inl) is pinned to cpu0 and parks
+	in WFE, which the scheduler can't see - to CFS it is a 100% busy nice 0
+	task that never sleeps. The audio thread is also SCHED_OTHER nice 0 and
+	sleeps ~1ms between short bursts, so its vruntime stays far behind the
+	spinner's and every hrtimer wakeup preempts it immediately (and the
+	resched IPI/timer IRQ also knocks the core out of WFE).
+*/
+static const u32 AUDIO_RING_MAX     = 2048;   // array size; ring may be smaller
+static const u32 AUDIO_RING_PUBLISH = 32;     // power of two
+static const long AUDIO_POLL_NS     = 1000000;
+static const long AUDIO_WAIT_NS     = 2000000; // producer futex timeout
+
+struct AudioRing {
+	// producer-owned
+	alignas(64) u32 write_pub;     // published write cursor (free-running)
+	u32 write_priv;                // producer-private cursor
+	u32 read_cache;                // producer's copy of read_pub
+	u32 size, mask;                // power of two <= AUDIO_RING_MAX
+	// consumer-owned; also the producer's futex word
+	alignas(64) u32 read_pub;
+	// set by the producer while it is waiting for room
+	alignas(64) u32 prod_waiting;
+	alignas(64) u32 data[AUDIO_RING_MAX]; // (r << 16) | l, as AUDIO_DATA wants
+};
+
+static AudioRing audio_ring;
+static bool audio_threaded;                   // ring + thread active
+static std::atomic<bool> audio_thread_stop;
+static std::atomic<bool> audio_thread_alive;
+static pthread_t audio_thread_handle;
+
+static inline long audio_futex(u32* addr, int op, u32 val, const struct timespec* ts)
+{
+	return syscall(SYS_futex, addr, op, val, ts, NULL, 0);
+}
+
+static void* audio_thread_main(void*)
+{
+	// Don't take process-directed signals: the polly2 module SIGUSR1s every
+	// /dev/polly2 holder, SIGTERM is sigwait()ed by main.cpp. Inherited mask
+	// already blocks SIGTERM; block the rest too (same as gdrom's fill thread).
+	sigset_t all;
+	sigfillset(&all);
+	pthread_sigmask(SIG_BLOCK, &all, NULL);
+
+	// cpu0, with the TA consumer; cpu1 belongs to the SH4 thread.
+	unsigned long cpumask = 1ul << 0;
+	if (syscall(SYS_sched_setaffinity, 0, sizeof(cpumask), &cpumask) != 0)
+		printf("audio: failed to pin feeder thread to cpu0\n");
+	else
+		printf("audio: FIFO feeder thread pinned to cpu0, ring %u\n", audio_ring.size);
+
+	AudioRing& R = audio_ring;
+	u32 rd = R.read_pub;
+	const struct timespec poll = { 0, AUDIO_POLL_NS };
+
+	while (!audio_thread_stop.load(std::memory_order_relaxed))
+	{
+		u32 wr = __atomic_load_n(&R.write_pub, __ATOMIC_ACQUIRE);
+		u32 avail = wr - rd;
+		if (avail)
+		{
+			u32 space = polly2_audio_space();
+			u32 n = avail < space ? avail : space;
+			for (u32 i = 0; i < n; i++)
+				polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, R.data[(rd + i) & R.mask]);
+
+			if (n)
+			{
+				rd += n;
+				__atomic_store_n(&R.read_pub, rd, __ATOMIC_SEQ_CST);
+				if (__atomic_load_n(&R.prod_waiting, __ATOMIC_SEQ_CST))
+					audio_futex(&R.read_pub, FUTEX_WAKE_PRIVATE, 1, NULL);
+			}
+		}
+		nanosleep(&poll, NULL);
+	}
+
+	audio_thread_alive.store(false, std::memory_order_release);
+	// in case the producer is parked (it isn't at TermAudio, but be safe)
+	audio_futex(&R.read_pub, FUTEX_WAKE_PRIVATE, 1, NULL);
+	return NULL;
+}
+
+// Producer slow path: the ring is full. Returns true once there is room,
+// false if the feeder thread is gone (caller drops the sample).
+static __attribute__((noinline)) bool audio_ring_wait(u32 wr)
+{
+	AudioRing& R = audio_ring;
+	// everything written so far must be visible for the consumer to drain it
+	__atomic_store_n(&R.write_pub, wr, __ATOMIC_RELEASE);
+
+	const struct timespec to = { 0, AUDIO_WAIT_NS };
+	for (;;)
+	{
+		__atomic_store_n(&R.prod_waiting, 1, __ATOMIC_SEQ_CST);
+		u32 rd = __atomic_load_n(&R.read_pub, __ATOMIC_SEQ_CST);
+		if (wr - rd < R.size || !audio_thread_alive.load(std::memory_order_acquire))
+		{
+			__atomic_store_n(&R.prod_waiting, 0, __ATOMIC_RELAXED);
+			R.read_cache = rd;
+			return wr - rd < R.size;
+		}
+		audio_futex(&R.read_pub, FUTEX_WAIT_PRIVATE, rd, &to);
+	}
+}
+
+static inline void audio_ring_put(u32 v, bool wait)
+{
+	AudioRing& R = audio_ring;
+	u32 wr = R.write_priv;
+
+	// the cached read cursor says full: refresh it, then wait or drop
+	if (wr - R.read_cache >= R.size)
+	{
+		R.read_cache = __atomic_load_n(&R.read_pub, __ATOMIC_ACQUIRE);
+		if (wr - R.read_cache >= R.size)
+		{
+			if (!wait || !audio_ring_wait(wr))
+				return;
+		}
+	}
+
+	R.data[wr & R.mask] = v;
+	wr++;
+	R.write_priv = wr;
+	if ((wr & (AUDIO_RING_PUBLISH - 1)) == 0)
+		__atomic_store_n(&R.write_pub, wr, __ATOMIC_RELEASE);
+}
+
+// Free output space for pacing (freerunning UpdateSystem): FIFO space minus
+// what is still queued in the ring. SH4 thread only (reads write_priv).
+u32 audio_output_space()
+{
+	if (!polly2_mmio)
+		return POLLY2_AUDIO_FIFO_DEPTH;
+
+	u32 space = polly2_audio_space();
+	if (audio_threaded)
+	{
+		u32 queued = audio_ring.write_priv - __atomic_load_n(&audio_ring.read_pub, __ATOMIC_RELAXED);
+		space = queued >= space ? 0 : space - queued;
+	}
+	return space;
+}
+
 struct AudioStream_Mister : AudioStream {
 	// AICA produces 44.1 kHz; the polly2 HDMI I2S side drains at 48 kHz.
 	// Push-side mirror of ReadAudioResampling: each input frame shifts the
@@ -327,14 +512,51 @@ struct AudioStream_Mister : AudioStream {
 				SaturateToS16(InterpolateCatmull4pt3oX(Status[0].l,Status[1].l,Status[2].l,Status[3].l,current_partial_pos)),
 				SaturateToS16(InterpolateCatmull4pt3oX(Status[0].r,Status[1].r,Status[2].r,Status[3].r,current_partial_pos))
 			};
+			if (audio_threaded) {
+				// ring full: wait (frame limiter) or drop, see above
+				audio_ring_put(((u32)(u16)res.r << 16) | (u16)res.l, wait);
+			}
 			// wait: the fabric stalls the store while the FIFO is full;
 			// otherwise drop rather than block the emu thread.
-			if (wait || (polly2_audio_space() > 1)) {
+			else if (wait || (polly2_audio_space() > 1)) {
 				polly2_audio_push(res.l, res.r);
 			}
 			current_partial_pos += inc;
 		}
 		current_partial_pos -= 1;
+	}
+
+	void StartThread()
+	{
+		int ring = cfgLoadInt("audio", "ring", 1024);
+		u32 size = 64;
+		while (size < AUDIO_RING_MAX && size < (u32)ring)
+			size <<= 1;
+
+		audio_ring.write_pub = audio_ring.write_priv = audio_ring.read_cache = 0;
+		audio_ring.read_pub = 0;
+		audio_ring.prod_waiting = 0;
+		audio_ring.size = size;
+		audio_ring.mask = size - 1;
+		audio_thread_stop.store(false);
+		audio_thread_alive.store(true);
+
+		// plain SCHED_OTHER even if the creating thread runs RT
+		pthread_attr_t attr;
+		pthread_attr_init(&attr);
+		pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+		pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
+		struct sched_param sp = {};
+		pthread_attr_setschedparam(&attr, &sp);
+		int err = pthread_create(&audio_thread_handle, &attr, audio_thread_main, NULL);
+		pthread_attr_destroy(&attr);
+
+		if (err != 0) {
+			printf("audio: feeder thread failed (%d), pushing from the emu thread\n", err);
+			audio_thread_alive.store(false);
+			return;
+		}
+		audio_threaded = true;
 	}
 
 	void InitAudio()
@@ -344,12 +566,24 @@ struct AudioStream_Mister : AudioStream {
 			return;
 		}
 
-		polly2_mmio_init();
+		if (polly2_mmio_init() != 0)
+			return;
+
+		if (cfgLoadInt("audio", "threaded", 1))
+			StartThread();
+		else
+			printf("audio: threaded feeder off, pushing from the emu thread\n");
 	}
 
 	void TermAudio()
 	{
-		
+		// Normal teardown only; the _exit()/SIGTERM exits just take the
+		// thread down with the process (it holds nothing that needs saving).
+		if (audio_threaded) {
+			audio_thread_stop.store(true);
+			pthread_join(audio_thread_handle, NULL);
+			audio_threaded = false;
+		}
 	}
 };
 

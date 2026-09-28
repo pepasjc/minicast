@@ -66,6 +66,11 @@ audiobackend_t* GetAudioBackend(int num);
 audiobackend_t* GetAudioBackend(std::string slug);
 
 
+// Free space in the audio output path (polly2 FIFO minus samples still
+// queued in the threaded feeder's ring), in 48 kHz stereo samples.
+// SH4 thread only.
+u32 audio_output_space();
+
 struct AudioStream {
 	static AudioStream* Create();
 
