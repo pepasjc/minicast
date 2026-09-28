@@ -58,17 +58,34 @@ void do_vram_dump(u8* vram, u8* pvr_regs) {
 #include <signal.h>
 #include <pthread.h>
 #include "stdclass.h"
+#include "ra_dc.h"
+
+// Upper bound for letting RetroAchievements submissions still in flight
+// finish on exit. The launcher's Start+L quit sends SIGTERM, waits 1.5 s,
+// taps ESC, waits 2 s more, then SIGKILLs - stay inside that. Only spent
+// when a request is actually pending (normally the exit is immediate).
+static const int RA_EXIT_FLUSH_MS = 3000;
 
 // The fast exits below (_exit on ESC / mapped Exit, SIGTERM from the
 // launcher) skip the normal teardown, which is what writes the Dreamcast
 // flash (BIOS settings: language, audio mode, ...) back to dc_nvmem.bin.
 static void save_before_exit()
 {
+	// First caller wins: with a RetroAchievements flush in progress (SIGTERM),
+	// the launcher's fallback ESC tap must not _exit() underneath it - a
+	// second caller parks here until the first one exits the process.
+	static std::atomic<bool> exiting(false);
+	if (exiting.exchange(true)) {
+		for (;;)
+			pause();
+	}
 	// same directory LoadRomFiles reads (libswirl.cpp), where dc_nvmem.bin
 	// takes precedence over dc_flash.bin on the next boot
 	SaveRomFiles("/media/fat/games/Dreamcast/");
 	fflush(stdout);
 	sync();
+	// after the flash: an achievement unlocked right before quitting
+	ra_shutdown(RA_EXIT_FLUSH_MS);
 }
 
 // SIGTERM is blocked in every thread and taken here synchronously, so the
@@ -108,8 +125,17 @@ int main(int argc, char* argv[])
 	ParseCommandLine(argc, argv);
 	cfgOpen();
 
+	const char* game = argc == 1 ? "" : argv[1];
+
+	// RetroAchievements: off (and free) unless /media/fat/retroachievements.cfg
+	// has a username and MINICAST_RA != 0; hashes the disc on its own thread
+	ra_init(game);
+
 	libswirl_init();
-	libswirl_loop(argc == 1 ? "": argv[1]);
+	libswirl_loop(game);
+
+	// normal teardown: stop reading emulated RAM before it is released
+	ra_shutdown(RA_EXIT_FLUSH_MS);
 
 	return 0;
 }

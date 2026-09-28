@@ -13,6 +13,7 @@
 #include "oslib/oslib.h"
 #include "hw/sh4/sh4_sched.h"
 #include "rend/mister_rend/mister_support.h"
+#include "ra_dc.h"
 
 //SPG emulation; Scanline/Raster beam registers & interrupts
 //Time to emulate that stuff correctly ;)
@@ -179,6 +180,9 @@ struct SPG_impl final : SPG {
                 asic->RaiseInterrupt(holly_HBLank);// -> This turned out to be HBlank btw , needs to be emulated ;(
                 //TODO : rend_if_VBlank();
                 rend_vblank();//notify for vblank :)
+                // RetroAchievements: one rc_client_do_frame per vblank, run
+                // on the RA thread (cpu0); a load + compare when RA is off
+                ra_frame_hook(RA_FRAME_VBLANK);
 
                 if ((os_GetSeconds() - last_stats) > 0.5)
                 {

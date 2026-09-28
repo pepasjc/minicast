@@ -41,6 +41,7 @@
 #include "hw/aica/aica_mmio.h"
 #include "hw/arm7/SoundCPU.h"
 #include "hw/pvr/ta_ring.h"
+#include "ra_dc.h"
 
 #define fault_printf(...)
 
@@ -652,6 +653,7 @@ struct Dreamcast_impl : VirtualDreamcast {
             if (reset_requested)
             {
                 virtualDreamcast->Reset();
+                ra_notify_reset();
                 sh4_cpu->Start();
 #ifdef SCRIPTING
                 luabindings_onreset();
@@ -795,6 +797,9 @@ struct Dreamcast_impl : VirtualDreamcast {
             printf("Failed to alloc mem\n");
             return false;
         }
+
+        // RetroAchievements reads the 16 MB system RAM from its own thread
+        ra_set_ram(sh4_cpu->mram.data, sh4_cpu->mram.size);
 
         auto sh4mmr = SuperH4Mmr::Create(sh4_cpu);
 

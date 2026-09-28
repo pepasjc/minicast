@@ -16,6 +16,7 @@
 
 #include "hw/pvr/ta_ring.h"
 #include "mister_support.h"
+#include "ra_dc.h"
 
 u32 FrameCount;
 static uint64_t RenderTime = 0;
@@ -183,6 +184,10 @@ void rend_end_render() {
     }
 	
     FrameCount++;
+
+    // RetroAchievements with dreamster_frame_source=render: one
+    // rc_client_do_frame per rendered frame instead of per vblank
+    ra_frame_hook(RA_FRAME_RENDER);
 
 	// per-frame render stats; mister_support tracks min/max per OSD window
 	ReportRendererStats((now_ns() - WaitTime) / 1e6, polly2_frame_cycles());

@@ -306,6 +306,19 @@ void SortAudioBackends()
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
+#include "ra_dc.h"
+
+/*
+	RetroAchievements unlock chime: mixed into the 48 kHz output words by
+	whichever thread pushes them to the FIFO - the feeder thread (cpu0) in
+	the default threaded mode, so the SH4 thread pays nothing; the emu
+	thread only in the legacy unthreaded mode. The RA thread just bumps
+	ra_chime_seq; poll() is one relaxed load per batch, mix() only runs
+	while the ~0.4 s chime is playing. Mixing at FIFO-push time puts the
+	chime at most one FIFO depth (~42 ms) behind the unlock.
+*/
+static RaChimeMixer chime_feeder;   // audio feeder thread
+static RaChimeMixer chime_direct;   // emu thread, unthreaded mode
 
 /*
 	Threaded FIFO feeder ("audio", "threaded" = 1, the default)
@@ -401,8 +414,18 @@ static void* audio_thread_main(void*)
 		{
 			u32 space = polly2_audio_space();
 			u32 n = avail < space ? avail : space;
-			for (u32 i = 0; i < n; i++)
-				polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, R.data[(rd + i) & R.mask]);
+			chime_feeder.poll();
+			if (chime_feeder.active()) {
+				for (u32 i = 0; i < n; i++) {
+					u32 v = R.data[(rd + i) & R.mask];
+					if (chime_feeder.active())
+						v = chime_feeder.mix(v);
+					polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, v);
+				}
+			} else {
+				for (u32 i = 0; i < n; i++)
+					polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, R.data[(rd + i) & R.mask]);
+			}
 
 			if (n)
 			{
@@ -519,6 +542,12 @@ struct AudioStream_Mister : AudioStream {
 			// wait: the fabric stalls the store while the FIFO is full;
 			// otherwise drop rather than block the emu thread.
 			else if (wait || (polly2_audio_space() > 1)) {
+				chime_direct.poll();
+				if (chime_direct.active()) {
+					u32 v = chime_direct.mix(((u32)(u16)res.r << 16) | (u16)res.l);
+					res.l = (s16)(v & 0xFFFF);
+					res.r = (s16)(v >> 16);
+				}
 				polly2_audio_push(res.l, res.r);
 			}
 			current_partial_pos += inc;
