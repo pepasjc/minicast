@@ -70,3 +70,23 @@ endif()
 
 # args: <base seed> <fuzz iterations>
 add_test(NAME constprop_test COMMAND constprop_test 1 3000)
+
+# RetroAchievements module (ra/) + rcheevos: memory mapping, dry-run
+# responses, chime loader/mixer; hashes any images given on the command line
+# (ra_test [--wav f] [--gameid] image.gdi ...). End to end against a fake
+# server: ra_test --flow dry|live image.gdi tests/ra_fake_curl.sh
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    enable_language(C)
+endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/../external/rcheevos.cmake)
+add_executable(ra_test ra_test.cpp ${RA_SOURCES})
+set_property(TARGET ra_test PROPERTY CXX_STANDARD 17)
+target_include_directories(ra_test PRIVATE ${RA_INCLUDE_DIRS})
+target_link_libraries(ra_test PRIVATE pthread)
+
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(ra_test PRIVATE -O1 -g -fsanitize=address,undefined)
+    target_link_options(ra_test PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_test(NAME ra_test COMMAND ra_test --wav ${CMAKE_CURRENT_SOURCE_DIR}/../ra/achievement.wav)
