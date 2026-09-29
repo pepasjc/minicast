@@ -15,7 +15,8 @@
 //                 busy with the previous frame this frame is skipped
 //   audio         RaChimeMixer (below) mixes the unlock chime into the
 //                 48 kHz output on the audio feeder thread
-//   (milestone 2) ra_notification_pop() for an on-screen popup renderer
+//   overlay       ra_notification_pop() for the popups, ra_list_request() /
+//                 ra_list_take() for the achievement list (ra_overlay.h)
 //
 // With /media/fat/retroachievements.cfg absent (or no username), or with
 // MINICAST_RA=0, ra_init() returns without starting anything and
@@ -106,15 +107,16 @@ struct RaChimeMixer {
 };
 
 // ---------------------------------------------------------------------------
-// notifications (for the milestone 2 on-screen popup)
+// notifications (shown as popups by ra_overlay)
 // ---------------------------------------------------------------------------
 
 enum ra_notification_kind {
-	RA_NOTIF_GAME_LOADED = 1,        // title = game, text = "x/y achievements (softcore)"
+	RA_NOTIF_GAME_LOADED = 1,        // title = game, text = "x of y achievements unlocked"
 	RA_NOTIF_ACHIEVEMENT,            // title/text = achievement title/description
 	RA_NOTIF_GAME_COMPLETED,
 	RA_NOTIF_LEADERBOARD_SUBMITTED,  // text = score
-	RA_NOTIF_ERROR,                  // text = message
+	RA_NOTIF_ERROR,                  // title = what failed, text = message
+	RA_NOTIF_INFO,                   // title/text = message
 };
 
 struct ra_notification_t {
@@ -131,6 +133,30 @@ struct ra_notification_t {
 // Pops the oldest pending notification (any single consumer thread).
 // Returns 1 if *out was filled. The queue keeps the newest 16.
 int ra_notification_pop(ra_notification_t* out);
+
+// Queues a notification from outside the RA thread (any thread).
+void ra_notify_local(int kind, const char* title, const char* text);
+
+// ---------------------------------------------------------------------------
+// state + settings for the overlay (any thread)
+// ---------------------------------------------------------------------------
+
+int ra_active(void);          // the RA thread is running
+int ra_game_ready(void);      // a game is identified and loaded
+int ra_cfg_popups(void);      // dreamster_popups (default 1) / MINICAST_RA_POPUPS
+int ra_cfg_popup_position(void);   // popup_position: RA_POS_* (ra_osd.h)
+int ra_cfg_list_hotkey(void); // dreamster_list_hotkey (default 1) / MINICAST_RA_LIST
+
+// ---------------------------------------------------------------------------
+// achievement list (built on the RA thread from rc_client)
+// ---------------------------------------------------------------------------
+
+struct ra_list_data;
+// Asks the RA thread for a snapshot of the achievement list; 0 if no game
+// is loaded. The result shows up in ra_list_take() within ~50 ms.
+int ra_list_request(void);
+// The finished snapshot (caller frees with ra_list_free), or NULL.
+ra_list_data* ra_list_take(void);
 
 // ---------------------------------------------------------------------------
 // logging (stdout = the per-game log the launcher captures)
@@ -149,3 +175,6 @@ int ra_test_hash(const char* path, char hash_out[33]);
 // Builds the fake server response a dry run hands rc_client for a
 // submission; returns NULL for requests that are not submissions.
 char* ra_test_dryrun_response(const char* post_data);
+// overlay tests without an RA thread: pretend a game is loaded, hand over a list
+void ra_test_set_game_ready(int ready);
+void ra_test_publish_list(ra_list_data* d);

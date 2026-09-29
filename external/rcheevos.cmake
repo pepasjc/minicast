@@ -45,7 +45,15 @@ set_source_files_properties(${RCHEEVOS_SOURCES} PROPERTIES
 set(RA_SOURCES
     ${_ra_root}/ra/ra_dc.cpp
     ${_ra_root}/ra/ra_http.cpp
+    ${_ra_root}/ra/ra_osd.cpp
     ${RCHEEVOS_SOURCES}
+)
+
+# the overlay runtime (threads, SH4 hooks) needs the emulator's frontend and
+# audio backend (ra_frontend_*, AudioSetPaused): emulator builds only, the
+# host tests link it against stubs
+set(RA_OVERLAY_SOURCES
+    ${_ra_root}/ra/ra_overlay.cpp
 )
 
 set(RA_INCLUDE_DIRS

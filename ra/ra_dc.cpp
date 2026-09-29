@@ -23,13 +23,17 @@
 //   dreamster_frame_source=vblank|render   what drives rc_client_do_frame
 //   dreamster_chime_volume=0..100          default 70
 //   dreamster_chime_test=1                 play the chime when the game loads
+//   dreamster_popups=0                     no on-screen popups (default on)
+//   popup_position=left|center|right       popup corner (MiSTer_RA's key)
+//   dreamster_list_hotkey=0                no achievement list hotkey
 // Environment (wins over the cfg): MINICAST_RA=0 (off), MINICAST_RA_DRYRUN,
 // MINICAST_RA_DEBUG, MINICAST_RA_FRAME, MINICAST_RA_CHIME_VOLUME,
-// MINICAST_RA_CHIME_TEST, and for tests MINICAST_RA_CFG / _WAV /
-// _UNLOCK_LOG / _CURL (alternate paths).
+// MINICAST_RA_CHIME_TEST, MINICAST_RA_POPUPS, MINICAST_RA_LIST, and for
+// tests MINICAST_RA_CFG / _WAV / _UNLOCK_LOG / _CURL (alternate paths).
 
 #include "ra_dc.h"
 #include "ra_http.h"
+#include "ra_osd.h"
 
 #include "rc_client.h"
 #include "rc_consoles.h"
@@ -129,6 +133,9 @@ struct RaConfig {
 	int frame_source;         // RA_FRAME_VBLANK / RA_FRAME_RENDER
 	int chime_volume;         // percent
 	int chime_test;           // play the chime once the game is identified
+	int popups;               // on-screen popups
+	int popup_position;       // RA_POS_*
+	int list_hotkey;          // achievement list hotkey
 };
 
 static RaConfig g_cfg;
@@ -147,6 +154,10 @@ static int load_config(void)
 	memset(&g_cfg, 0, sizeof(g_cfg));
 	g_cfg.frame_source = RA_FRAME_VBLANK;
 	g_cfg.chime_volume = 70;
+	g_cfg.popups = 1;
+	g_cfg.popup_position = RA_POS_LEFT;
+	g_cfg.list_hotkey = 1;
+	int bad_position = 0;
 
 	const char* path = env_str("MINICAST_RA_CFG");
 	FILE* f = fopen(path ? path : RA_CFG_PATH, "r");
@@ -186,6 +197,17 @@ static int load_config(void)
 			g_cfg.chime_volume = atoi(val);
 		else if (!strcasecmp(key, "dreamster_chime_test"))
 			g_cfg.chime_test = atoi(val);
+		else if (!strcasecmp(key, "dreamster_popups"))
+			g_cfg.popups = atoi(val);
+		else if (!strcasecmp(key, "dreamster_list_hotkey"))
+			g_cfg.list_hotkey = atoi(val);
+		else if (!strcasecmp(key, "popup_position")) {
+			int p = ra_parse_position(val);
+			if (p < 0)
+				bad_position = 1;
+			else
+				g_cfg.popup_position = p;
+		}
 	}
 	fclose(f);
 
@@ -201,6 +223,12 @@ static int load_config(void)
 		g_cfg.chime_volume = atoi(v);
 	if ((v = env_str("MINICAST_RA_CHIME_TEST")))
 		g_cfg.chime_test = atoi(v);
+	if ((v = env_str("MINICAST_RA_POPUPS")))
+		g_cfg.popups = atoi(v);
+	if ((v = env_str("MINICAST_RA_LIST")))
+		g_cfg.list_hotkey = atoi(v);
+	if (bad_position && g_cfg.user[0])
+		ra_log("popup_position not left/center/right, using left");
 	if (g_cfg.chime_volume < 0)
 		g_cfg.chime_volume = 0;
 	if (g_cfg.chime_volume > 100)
@@ -233,6 +261,9 @@ static std::atomic<int> g_thread_done{0};
 static std::atomic<int> g_quit{0};
 static std::atomic<int> g_quit_timeout_ms{3000};
 static std::atomic<int> g_reset_pending{0};
+static std::atomic<int> g_game_ready{0};             // load done, until shutdown
+static std::atomic<int> g_list_req{0};               // overlay wants a list snapshot
+static std::atomic<ra_list_data*> g_list_result{nullptr};
 
 // frame handshake: set by the SH4 thread when it wakes the RA thread,
 // cleared by the RA thread once that frame is processed
@@ -421,6 +452,11 @@ static void notify(int kind, uint32_t id, uint32_t points, const char* badge,
 	n->time_ms = mono_ms();
 	g_notif_head++;
 	pthread_mutex_unlock(&g_notif_mutex);
+}
+
+void ra_notify_local(int kind, const char* title, const char* text)
+{
+	notify(kind, 0, 0, "", title, text);
 }
 
 int ra_notification_pop(ra_notification_t* out)
@@ -709,10 +745,14 @@ static void RC_CCONV load_game_callback(int result, const char* error_message, r
 {
 	(void)userdata;
 	if (result != RC_OK) {
-		if (result == RC_NO_GAME_LOADED)
+		if (result == RC_NO_GAME_LOADED) {
 			ra_log("game not recognized by RetroAchievements (hash %s), RA idle for this session", g_hash);
-		else
+			notify(RA_NOTIF_INFO, 0, 0, "", "RetroAchievements", "Game not recognized - no achievements");
+		} else {
 			ra_log("game load failed: %s (%d)", error_message ? error_message : "?", result);
+			notify(RA_NOTIF_ERROR, 0, 0, "", "RetroAchievements: game load failed",
+				error_message ? error_message : "unknown error");
+		}
 		g_ra_dead = 1;
 		stop_frames();
 		return;
@@ -730,11 +770,12 @@ static void RC_CCONV load_game_callback(int result, const char* error_message, r
 		g_cfg.frame_source == RA_FRAME_RENDER ? "render end" : "vblank");
 
 	char text[96];
-	snprintf(text, sizeof(text), "%u/%u achievements (softcore)",
+	snprintf(text, sizeof(text), "%u of %u achievements unlocked",
 		sum.num_unlocked_achievements, sum.num_core_achievements);
 	notify(RA_NOTIF_GAME_LOADED, game->id, sum.points_core, game->badge_name, game->title, text);
 
 	g_game_loaded = 1;
+	g_game_ready.store(1, std::memory_order_release);
 	if (g_cfg.chime_test) {
 		ra_log("chime test (dreamster_chime_test / MINICAST_RA_CHIME_TEST)");
 		play_chime();
@@ -748,6 +789,8 @@ static void RC_CCONV login_callback(int result, const char* error_message, rc_cl
 	(void)userdata;
 	if (result != RC_OK) {
 		ra_log("LOGIN FAILED for '%s': %s (%d)", g_cfg.user, error_message ? error_message : "?", result);
+		notify(RA_NOTIF_ERROR, 0, 0, "", "RetroAchievements login failed",
+			error_message ? error_message : "check retroachievements.cfg");
 		g_ra_dead = 1;
 		return;
 	}
@@ -808,6 +851,58 @@ static void log_stats(const char* when)
 		(unsigned long long)g_frame_us_max);
 }
 
+// Achievement list snapshot for the overlay: every core achievement with its
+// strings copied (ASCII), unlocked first. rc_client's lock-state grouping
+// already puts "recently unlocked" ahead of older unlocks.
+static void build_list(void)
+{
+	uint64_t t0 = mono_us();
+	rc_client_achievement_list_t* list = rc_client_create_achievement_list(g_client,
+		RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE, RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+	uint32_t total = 0;
+	if (list)
+		for (uint32_t b = 0; b < list->num_buckets; b++)
+			total += list->buckets[b].num_achievements;
+
+	ra_list_data* d = (ra_list_data*)calloc(1, sizeof(ra_list_data));
+	if (d && total)
+		d->items = (ra_list_item*)calloc(total, sizeof(ra_list_item));
+	if (!d || (total && !d->items)) {
+		ra_log("list: out of memory");
+		ra_list_free(d);
+		if (list)
+			rc_client_destroy_achievement_list(list);
+		return;
+	}
+	const rc_client_game_t* game = rc_client_get_game_info(g_client);
+	ra_to_ascii(game && game->title ? game->title : "", d->game, sizeof(d->game));
+	for (uint32_t b = 0; list && b < list->num_buckets; b++) {
+		const rc_client_achievement_bucket_t& bk = list->buckets[b];
+		for (uint32_t i = 0; i < bk.num_achievements; i++) {
+			const rc_client_achievement_t* a = bk.achievements[i];
+			ra_list_item& it = d->items[d->count++];
+			it.id = a->id;
+			it.points = a->points;
+			it.unlocked = a->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED ||
+				(a->unlocked & RC_CLIENT_ACHIEVEMENT_UNLOCKED_SOFTCORE);
+			it.unsupported = a->state == RC_CLIENT_ACHIEVEMENT_STATE_DISABLED ||
+				bk.bucket_type == RC_CLIENT_ACHIEVEMENT_BUCKET_UNSUPPORTED;
+			it.unlock_time = it.unlocked ? (int64_t)a->unlock_time : 0;
+			ra_to_ascii(a->title, it.title, sizeof(it.title));
+			ra_to_ascii(a->description, it.desc, sizeof(it.desc));
+			ra_to_ascii(a->measured_progress, it.progress, sizeof(it.progress));
+		}
+	}
+	if (list)
+		rc_client_destroy_achievement_list(list);
+	ra_list_sort(d);
+	ra_list_totals(d);
+	ra_log("list: %u achievements, %u unlocked (%u/%u pts), built in %llu us",
+		d->count, d->num_unlocked, d->points_unlocked, d->points_total,
+		(unsigned long long)(mono_us() - t0));
+	ra_list_free(g_list_result.exchange(d, std::memory_order_acq_rel));
+}
+
 // 1 = frame signaled, 0 = timeout / quit
 static int wait_frame(int timeout_ms)
 {
@@ -829,6 +924,7 @@ static int wait_frame(int timeout_ms)
 static void flush_and_close(void)
 {
 	stop_frames();
+	g_game_ready.store(0, std::memory_order_release);
 	int timeout = g_quit_timeout_ms.load();
 	uint64_t start = mono_ms(), deadline = start + (uint64_t)(timeout > 0 ? timeout : 0);
 	int pending = ra_http_pending();
@@ -925,6 +1021,8 @@ static void* ra_thread_main(void*)
 
 		ra_http_poll();
 		maybe_load_game();
+		if (g_list_req.exchange(0) && g_game_loaded)
+			build_list();
 		if (g_reset_pending.exchange(0) && g_game_loaded) {
 			ra_log("console reset: achievement runtime reset");
 			rc_client_reset(g_client);
@@ -1006,6 +1104,33 @@ void ra_init(const char* game_path)
 	g_thread_running.store(1, std::memory_order_release);
 }
 
+int ra_active(void)
+{
+	return g_thread_running.load(std::memory_order_acquire) && !g_quit.load(std::memory_order_acquire);
+}
+
+int ra_game_ready(void)
+{
+	return g_game_ready.load(std::memory_order_acquire);
+}
+
+int ra_cfg_popups(void) { return g_cfg.popups; }
+int ra_cfg_popup_position(void) { return g_cfg.popup_position; }
+int ra_cfg_list_hotkey(void) { return g_cfg.list_hotkey; }
+
+int ra_list_request(void)
+{
+	if (!ra_game_ready())
+		return 0;
+	g_list_req.store(1, std::memory_order_release);
+	return 1;
+}
+
+ra_list_data* ra_list_take(void)
+{
+	return g_list_result.exchange(nullptr, std::memory_order_acq_rel);
+}
+
 void ra_notify_reset(void)
 {
 	if (g_thread_running.load(std::memory_order_acquire))
@@ -1052,4 +1177,14 @@ int ra_test_hash(const char* path, char hash_out[33])
 char* ra_test_dryrun_response(const char* post_data)
 {
 	return dryrun_response(post_data);
+}
+
+void ra_test_set_game_ready(int ready)
+{
+	g_game_ready.store(ready, std::memory_order_release);
+}
+
+void ra_test_publish_list(ra_list_data* d)
+{
+	ra_list_free(g_list_result.exchange(d, std::memory_order_acq_rel));
 }
