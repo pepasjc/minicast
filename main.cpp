@@ -401,10 +401,14 @@ int kbhit(void) {
 // ButtonExit / ButtonScreenshot in an [inputN] section additionally map a
 // per-device button (or key) to the same two actions.
 //
-// RetroAchievements achievement list (ra_overlay): Start + Select held 0.5 s
-// on a mapped pad, or F6 on any keyboard. Select is the pad's BTN_SELECT
-// (or the [inputN] ButtonSelect = key:<code> mapping); the Dreamcast has no
-// Select, so while it is held the pad's Start is kept from the game. While
+// RetroAchievements achievement list (ra_overlay): Start + Select or Start + R
+// held 0.5 s on a mapped pad, or F6 on any keyboard. Select is the pad's
+// BTN_SELECT (or the [inputN] ButtonSelect = key:<code> mapping); the Dreamcast
+// has no Select, so while it is held the pad's Start is kept from the game.
+// Start + R is for pads without a Select (arcade sticks, where the coin button
+// is usually the Exit button): R is the mapped R trigger (digital, or analog
+// past ~80%); R and Start still reach the game (a quick Start tap pauses as
+// usual - racing games hold R), only a 0.5 s hold of both opens the list. While
 // the list is open the arrow keys / Enter / Backspace / PgUp / PgDn of any
 // keyboard work too.
 
@@ -1443,16 +1447,20 @@ static void evdev_update() {
 		p.actPrev[0] = p.held[TGT_BTN_EXIT];
 		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
-		// RetroAchievements list hotkey: Start + Select held 0.5 s (once per
-		// hold); Select keeps Start from the game while the list is usable
-		bool ra_sel = p.selHeld && ra_overlay_list_enabled();
-		if (ra_sel && p.held[TGT_BTN_START]) {
+		// RetroAchievements list hotkey: Start + Select or Start + R held 0.5 s
+		// (once per hold); Select keeps Start from the game while the list is
+		// usable, R does not (see the header comment)
+		bool ra_on = ra_overlay_list_enabled();
+		bool ra_sel = p.selHeld && ra_on;
+		bool ra_r = ra_on && p.trig[1] >= 204;
+		if ((ra_sel || ra_r) && p.held[TGT_BTN_START]) {
 			uint64_t now = mono_ns();
 			if (!p.comboSince)
 				p.comboSince = now;
 			else if (!p.comboFired && now - p.comboSince >= 500000000ULL) {
 				p.comboFired = true;
-				printf("evdev: Start+Select on %s (achievement list)\n", p.path.c_str());
+				printf("evdev: Start+%s on %s (achievement list)\n",
+				       ra_sel ? "Select" : "R", p.path.c_str());
 				ra_overlay_hotkey();
 			}
 		} else {
