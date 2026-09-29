@@ -11,6 +11,7 @@
 
 #include "ra_dc.h"
 #include "ra_http.h"
+#include "ra_osd.h"   // ra_list_data
 
 #include "rc_api_runtime.h"
 #include "rc_api_info.h"
@@ -238,11 +239,40 @@ static int flow_test(bool dry, const char* image, const char* fake_curl)
 
 	CHECK(run_frames_until(20000, [] { drain_notifications(); return game_loaded; }));
 	CHECK(ra_frame_source.load() == RA_FRAME_VBLANK);
+	CHECK(ra_game_ready());
+
+	// achievement list snapshot for the overlay: nothing unlocked yet
+	CHECK(ra_list_request());
+	ra_list_data* list = NULL;
+	for (int i = 0; i < 100 && !list; i++) {
+		usleep(10000);
+		list = ra_list_take();
+	}
+	CHECK(list && list->count == 2 && list->num_unlocked == 0 && list->points_total == 15);
+	if (list) {
+		CHECK(!strcmp(list->game, "Fake Game"));
+		CHECK(!strcmp(list->items[0].title, "Byte") || !strcmp(list->items[0].title, "Dword"));
+		ra_list_free(list);
+	}
 
 	// conditions false for a while (achievements must see false before true)
 	run_frames_until(300, [] { return false; });
 	ram[0x100] = 1;
 	CHECK(run_frames_until(3000, [] { drain_notifications(); return unlocks_seen >= 1; }));
+	// one unlocked: it sorts first
+	CHECK(ra_list_request());
+	list = NULL;
+	for (int i = 0; i < 100 && !list; i++) {
+		usleep(10000);
+		list = ra_list_take();
+	}
+	CHECK(list && list->count == 2 && list->num_unlocked == 1 && list->points_unlocked == 5);
+	if (list) {
+		CHECK(list->items[0].unlocked && list->items[0].id == 101 && !strcmp(list->items[0].title, "Byte"));
+		CHECK(!list->items[1].unlocked && list->items[1].id == 102);
+		CHECK(!strcmp(list->items[1].desc, "RA 0x200 becomes 0x11223344 (little-endian)"));
+		ra_list_free(list);
+	}
 	ram[0x200] = 0x44; ram[0x201] = 0x33; ram[0x202] = 0x22; ram[0x203] = 0x11;
 	CHECK(run_frames_until(3000, [] { drain_notifications(); return unlocks_seen >= 2; }));
 

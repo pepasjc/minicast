@@ -90,3 +90,17 @@ if(NOT CMAKE_CROSSCOMPILING)
 endif()
 
 add_test(NAME ra_test COMMAND ra_test --wav ${CMAKE_CURRENT_SOURCE_DIR}/../ra/achievement.wav)
+
+# RetroAchievements overlay (ra_osd + ra_overlay against a fake VRAM, the
+# frontend/audio hooks stubbed in the test): ra_osd_test [preview_dir]
+add_executable(ra_osd_test ra_osd_test.cpp ${RA_SOURCES} ${RA_OVERLAY_SOURCES})
+set_property(TARGET ra_osd_test PROPERTY CXX_STANDARD 17)
+target_include_directories(ra_osd_test PRIVATE ${RA_INCLUDE_DIRS})
+target_link_libraries(ra_osd_test PRIVATE pthread)
+
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(ra_osd_test PRIVATE -O1 -g -fsanitize=address,undefined)
+    target_link_options(ra_osd_test PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_test(NAME ra_osd_test COMMAND ra_osd_test)
