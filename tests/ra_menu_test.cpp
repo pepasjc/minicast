@@ -501,6 +501,42 @@ static void test_menu()
 	printf("menu: ok\n");
 }
 
+// Exit Game (back to the launcher's list) vs Exit Emulator, reached by
+// wrapping up from Resume
+static void test_exit_items()
+{
+	put_file("games.json", GAMES_JSON);
+	RaMenu m;
+	m.init(g_dir, "/media/fat/games/Dreamcast/DOA2/Dead or Alive 2 (USA).gdi", &FAKE_HW, true);
+
+	m.open(RA_STATE_OFF);
+	CHECK(m.input(RA_MENU_UP, 0) == RA_MACT_REDRAW);     // wraps: Exit Emulator
+	CHECK(m.input(RA_MENU_UP, 0) == RA_MACT_REDRAW);     // Exit Game
+	CHECK(m.input(RA_MENU_A, 0) == RA_MACT_REDRAW && m.page() == RaMenu::P_CONFIRM);
+	render_both(m);
+	CHECK(m.input(RA_MENU_A, 0) == RA_MACT_REDRAW && m.page() == RaMenu::P_MAIN);  // No
+	CHECK(!exists("request.json"));
+	CHECK(m.input(RA_MENU_A, 0) == RA_MACT_REDRAW && m.page() == RaMenu::P_CONFIRM);
+	CHECK(m.input(RA_MENU_DOWN, 0) == RA_MACT_REDRAW);   // Yes
+	CHECK(m.input(RA_MENU_A, 0) == RA_MACT_EXIT);
+	CHECK(m.request_action() == "list");
+	RaJson j = read_json("request.json");
+	CHECK(j.get_str("action") && !strcmp(j.get_str("action"), "list"));
+	render_both(m);
+	unlink(path_in("request.json").c_str());
+
+	RaMenu e;
+	e.init(g_dir, "/media/fat/games/Dreamcast/DOA2/Dead or Alive 2 (USA).gdi", &FAKE_HW, true);
+	e.open(RA_STATE_OFF);
+	CHECK(e.input(RA_MENU_UP, 0) == RA_MACT_REDRAW);     // Exit Emulator
+	CHECK(e.input(RA_MENU_A, 0) == RA_MACT_REDRAW && e.page() == RaMenu::P_CONFIRM);
+	CHECK(e.input(RA_MENU_DOWN, 0) == RA_MACT_REDRAW);
+	CHECK(e.input(RA_MENU_A, 0) == RA_MACT_EXIT && e.request_action() == "exit");
+	j = read_json("request.json");
+	CHECK(j.get_str("action") && !strcmp(j.get_str("action"), "exit"));
+	printf("exit items: ok\n");
+}
+
 int main()
 {
 	snprintf(g_dir, sizeof(g_dir), "/tmp/ra_menu_test.XXXXXX");
@@ -513,6 +549,7 @@ int main()
 	test_games();
 	test_files();
 	test_menu();
+	test_exit_items();
 	// clean up
 	const char* files[] = { "games.json", "options.json", "request.json", "options_changed.json" };
 	for (const char* f : files)

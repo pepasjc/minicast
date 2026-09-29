@@ -965,8 +965,9 @@ static void* menu_driver(void* arg)
 	press(RA_MENU_DOWN);          // vertical filter
 	press(RA_MENU_LEFT);          // smooth -> light
 	press(RA_MENU_B);             // main page
+	press(RA_MENU_DOWN);          // Exit Game
 	press(RA_MENU_DOWN);          // Exit Emulator
-	press(RA_MENU_A);             // "Quit the game?"
+	press(RA_MENU_A);             // "Leave DreamSTer?"
 	press(RA_MENU_DOWN);          // Yes
 	press(RA_MENU_A);             // request.json + exit
 	s->phase = 1;

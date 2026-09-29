@@ -6,7 +6,8 @@
 // and puts the rendered canvas on screen; the registers are reached through
 // the RaMenuHw callbacks (host tests stub them).
 //
-// Pages: Main (Resume / Load Game / Achievements / Options / Exit Emulator),
+// Pages: Main (Resume / Load Game / Achievements / Options / Exit Game /
+// Exit Emulator),
 // the game list, Options (Volume, Vertical filter, 480i field order,
 // Achievement popups; applied as they change), a Yes/No confirmation for
 // loading a game or exiting, and the "Exiting..." page shown while the
@@ -24,7 +25,9 @@
 //                         retroachievements.cfg setting)
 //   request.json          minicast -> launcher, written (tmp + rename) right
 //                         before the graceful exit the menu starts:
-//                         {"action":"load","path":"<gdi>"} or {"action":"exit"}
+//                         {"action":"load","path":"<gdi>"}, {"action":"list"}
+//                         (Exit Game: back to the launcher's game list) or
+//                         {"action":"exit"}
 //   options_changed.json  minicast -> launcher, the full option set (same
 //                         keys/values as options.json), rewritten (tmp +
 //                         rename) after every change
@@ -118,7 +121,8 @@ enum {
 class RaMenu {
 public:
 	enum Page { P_MAIN, P_GAMES, P_OPTIONS, P_CONFIRM, P_EXITING };
-	enum { M_RESUME, M_LOAD, M_ACHIEVEMENTS, M_OPTIONS, M_EXIT, M_COUNT };
+	enum { M_RESUME, M_LOAD, M_ACHIEVEMENTS, M_OPTIONS, M_QUIT_GAME, M_EXIT, M_COUNT };
+	enum Confirm { C_LOAD, C_QUIT_GAME, C_EXIT };
 	enum { O_VOLUME, O_VFILTER, O_FIELD, O_POPUPS, O_COUNT };
 
 	// dir: protocol directory; game_path: argv[1]; popups_default: the RA
@@ -176,7 +180,7 @@ private:
 	int main_sel_ = M_RESUME;
 	int opt_sel_ = O_VOLUME;
 	RaListView gv_ = {};         // game list view
-	bool confirm_load_ = false;  // confirm page: load (gv_.sel) or exit
+	Confirm confirm_ = C_EXIT;   // confirm page: load (gv_.sel), exit game or exit emulator
 	int confirm_sel_ = 0;        // 0 = No, 1 = Yes
 	std::string error_;
 	std::string req_action_, req_path_;

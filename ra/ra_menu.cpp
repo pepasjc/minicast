@@ -539,12 +539,12 @@ void RaMenu::letter_jump(int dir)
 int RaMenu::do_confirm()
 {
 	if (confirm_sel_ != 1) {
-		page_ = confirm_load_ ? P_GAMES : P_MAIN;
+		page_ = confirm_ == C_LOAD ? P_GAMES : P_MAIN;
 		error_.clear();
 		return RA_MACT_REDRAW;
 	}
 	std::string path = dir_ + "/request.json";
-	if (confirm_load_) {
+	if (confirm_ == C_LOAD) {
 		const RaGame& g = games_.games[gv_.sel];
 		if (!ra_menu_write_atomic(path.c_str(), ra_menu_request_json("load", g.path.c_str()))) {
 			ra_menu_log("could not write %s (%s)", path.c_str(), strerror(errno));
@@ -555,12 +555,15 @@ int RaMenu::do_confirm()
 		req_path_ = g.path;
 		ra_menu_log("request: load %s", g.path.c_str());
 	} else {
-		// exiting works without the file too (the launcher's default)
-		if (!ra_menu_write_atomic(path.c_str(), ra_menu_request_json("exit", NULL)))
+		// Exit Game = back to the launcher's game list, which is also what it
+		// does without any request, so both work even if the file can't be
+		// written (then Exit Emulator degrades to Exit Game)
+		const char* action = confirm_ == C_QUIT_GAME ? "list" : "exit";
+		if (!ra_menu_write_atomic(path.c_str(), ra_menu_request_json(action, NULL)))
 			ra_menu_log("could not write %s (%s), exiting anyway", path.c_str(), strerror(errno));
 		else
-			ra_menu_log("request: exit");
-		req_action_ = "exit";
+			ra_menu_log("request: %s", action);
+		req_action_ = action;
 		req_path_.clear();
 	}
 	page_ = P_EXITING;
@@ -610,9 +613,10 @@ int RaMenu::input(uint32_t pressed, uint32_t held)
 			for (int i = 0; i < O_COUNT && !opt_enabled(opt_sel_); i++)
 				opt_sel_ = (opt_sel_ + 1) % O_COUNT;
 			return RA_MACT_REDRAW;
+		case M_QUIT_GAME:
 		case M_EXIT:
 			page_ = P_CONFIRM;
-			confirm_load_ = false;
+			confirm_ = main_sel_ == M_QUIT_GAME ? C_QUIT_GAME : C_EXIT;
 			confirm_sel_ = 0;
 			error_.clear();
 			return RA_MACT_REDRAW;
@@ -646,7 +650,7 @@ int RaMenu::input(uint32_t pressed, uint32_t held)
 		}
 		if (pressed & RA_MENU_A) {
 			page_ = P_CONFIRM;
-			confirm_load_ = true;
+			confirm_ = C_LOAD;
 			confirm_sel_ = 0;
 			error_.clear();
 			return RA_MACT_REDRAW;
@@ -758,7 +762,7 @@ std::string RaMenu::title() const
 
 void RaMenu::render_main(RaCanvas* c, int mx, int cols) const
 {
-	static const char* const LABEL[M_COUNT] = { "Resume", "Load Game", "Achievements", "Options", "Exit Emulator" };
+	static const char* const LABEL[M_COUNT] = { "Resume", "Load Game", "Achievements", "Options", "Exit Game", "Exit Emulator" };
 	header(c, mx, cols, title().c_str(), "Game paused", RA_C_TEXT);
 	for (int i = 0; i < M_COUNT; i++) {
 		int y = MENU_ROWS_Y + i * MENU_ROW_H;
@@ -870,7 +874,7 @@ void RaMenu::render_confirm(RaCanvas* c, int mx, int cols) const
 {
 	char buf[512], a[256], fit[256];
 	int y = MENU_ROWS_Y;
-	if (confirm_load_) {
+	if (confirm_ == C_LOAD) {
 		header(c, mx, cols, "Load Game", "", RA_C_TEXT);
 		ra_canvas_text(c, mx + 8, y, "Load this game?", RA_C_TEXT, -1);
 		ra_to_ascii(games_.games[gv_.sel].name.c_str(), a, sizeof(a));
@@ -878,11 +882,16 @@ void RaMenu::render_confirm(RaCanvas* c, int mx, int cols) const
 		ra_canvas_text(c, mx + 8, y + 14, fit, RA_C_GOLD, cols - 1);
 		y += 32;
 		snprintf(buf, sizeof(buf), "The running game is closed: progress since the last save is lost.");
+	} else if (confirm_ == C_QUIT_GAME) {
+		header(c, mx, cols, "Exit Game", "", RA_C_TEXT);
+		ra_canvas_text(c, mx + 8, y, "Quit to the DreamSTer menu?", RA_C_TEXT, -1);
+		y += 18;
+		snprintf(buf, sizeof(buf), "The game closes: progress since the last save is lost.");
 	} else {
 		header(c, mx, cols, "Exit Emulator", "", RA_C_TEXT);
-		ra_canvas_text(c, mx + 8, y, "Quit the game?", RA_C_TEXT, -1);
+		ra_canvas_text(c, mx + 8, y, "Leave DreamSTer?", RA_C_TEXT, -1);
 		y += 18;
-		snprintf(buf, sizeof(buf), "The emulator closes: progress since the last save is lost.");
+		snprintf(buf, sizeof(buf), "Back to the MiSTer menu: progress since the last save is lost.");
 	}
 	char wrapped[512];
 	int n = ra_wrap(buf, cols - 1, 2, wrapped, sizeof(wrapped));
@@ -913,7 +922,8 @@ void RaMenu::render_confirm(RaCanvas* c, int mx, int cols) const
 void RaMenu::render_exiting(RaCanvas* c, int mx, int cols) const
 {
 	bool load = req_action_ == "load";
-	header(c, mx, cols, load ? "Load Game" : "Exit Emulator", "", RA_C_TEXT);
+	header(c, mx, cols, load ? "Load Game" : req_action_ == "list" ? "Exit Game" : "Exit Emulator",
+	       "", RA_C_TEXT);
 	text_center(c, 108, load ? "Loading..." : "Exiting...", RA_C_GOLD);
 	if (load) {
 		char a[256], fit[256];
