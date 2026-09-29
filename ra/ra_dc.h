@@ -143,6 +143,17 @@ void ra_notify_local(int kind, const char* title, const char* text);
 
 int ra_active(void);          // the RA thread is running
 int ra_game_ready(void);      // a game is identified and loaded
+
+// where RetroAchievements stands (the in-game menu says why there is no list)
+enum ra_state_t {
+	RA_STATE_OFF = 0,             // not configured / MINICAST_RA=0 / shut down
+	RA_STATE_STARTING,            // hashing, logging in, loading the game
+	RA_STATE_READY,               // game loaded (= ra_game_ready)
+	RA_STATE_NOT_RECOGNIZED,      // the disc hash is unknown to RetroAchievements
+	RA_STATE_LOGIN_FAILED,
+	RA_STATE_FAILED,              // hash / client / game load failed
+};
+int ra_state(void);
 int ra_cfg_popups(void);      // dreamster_popups (default 1) / MINICAST_RA_POPUPS
 int ra_cfg_popup_position(void);   // popup_position: RA_POS_* (ra_osd.h)
 int ra_cfg_list_hotkey(void); // dreamster_list_hotkey (default 1) / MINICAST_RA_LIST
@@ -177,4 +188,6 @@ int ra_test_hash(const char* path, char hash_out[33]);
 char* ra_test_dryrun_response(const char* post_data);
 // overlay tests without an RA thread: pretend a game is loaded, hand over a list
 void ra_test_set_game_ready(int ready);
+// menu tests: what ra_state() reports while no RA thread runs (default OFF)
+void ra_test_set_state(int state);
 void ra_test_publish_list(ra_list_data* d);

@@ -1022,12 +1022,14 @@ bool ra_list_render(RaCanvas* c, const ra_list_data* d, const RaListView& v, boo
 	ra_canvas_text(c, mx, LIST_TOP + 10, buf, RA_C_TEXT, cols);
 	ra_canvas_fill(c, mx, LIST_TOP + 20, c->w - 2 * mx, 1, RA_C_SEP);
 
-	const char* help = cols >= 60 ? "Up/Down: select   L/R: page   A: details   B: close"
-	                              : "L/R:page A:info B:close";
+	const char* help = cols >= 60 ? (v.in_menu ? "Up/Down: select   L/R: page   A: details   B: back"
+	                                           : "Up/Down: select   L/R: page   A: details   B: close")
+	                              : (v.in_menu ? "L/R:page A:info B:back" : "L/R:page A:info B:close");
 	if (!d || !d->count) {
 		const char* msg = d ? "This game has no achievements" : "";
 		ra_canvas_text(c, (c->w - 8 * (int)strlen(msg)) / 2, 116, msg, RA_C_DIM, cols);
-		list_footer(c, mx, cols, cols >= 60 ? "B: close" : "B:close", "");
+		const char* b = v.in_menu ? (cols >= 60 ? "B: back" : "B:back") : (cols >= 60 ? "B: close" : "B:close");
+		list_footer(c, mx, cols, b, "");
 		return true;
 	}
 

@@ -328,6 +328,7 @@ struct RaListView {
 	int sel, first;
 	int per_page;       // from ra_list_per_page()
 	bool detail;
+	bool in_menu;       // opened from the in-game menu: B goes back, not "close"
 };
 int ra_list_per_page(int src_w);
 void ra_list_nav(RaListView* v, int count, int action);

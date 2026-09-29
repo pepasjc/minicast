@@ -104,3 +104,17 @@ if(NOT CMAKE_CROSSCOMPILING)
 endif()
 
 add_test(NAME ra_osd_test COMMAND ra_osd_test)
+
+# In-game menu (ra_menu + ra_json): JSON parse/write, options, CRT_CTRL
+# read-modify-write, launcher protocol files, page navigation
+add_executable(ra_menu_test ra_menu_test.cpp ${RA_SOURCES})
+set_property(TARGET ra_menu_test PROPERTY CXX_STANDARD 17)
+target_include_directories(ra_menu_test PRIVATE ${RA_INCLUDE_DIRS})
+target_link_libraries(ra_menu_test PRIVATE pthread)
+
+if(NOT CMAKE_CROSSCOMPILING)
+    target_compile_options(ra_menu_test PRIVATE -O1 -g -fsanitize=address,undefined)
+    target_link_options(ra_menu_test PRIVATE -fsanitize=address,undefined)
+endif()
+
+add_test(NAME ra_menu_test COMMAND ra_menu_test)

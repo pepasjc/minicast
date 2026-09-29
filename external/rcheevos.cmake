@@ -46,6 +46,8 @@ set(RA_SOURCES
     ${_ra_root}/ra/ra_dc.cpp
     ${_ra_root}/ra/ra_http.cpp
     ${_ra_root}/ra/ra_osd.cpp
+    ${_ra_root}/ra/ra_json.cpp
+    ${_ra_root}/ra/ra_menu.cpp
     ${RCHEEVOS_SOURCES}
 )
 

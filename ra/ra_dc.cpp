@@ -25,7 +25,10 @@
 //   dreamster_chime_test=1                 play the chime when the game loads
 //   dreamster_popups=0                     no on-screen popups (default on)
 //   popup_position=left|center|right       popup corner (MiSTer_RA's key)
-//   dreamster_list_hotkey=0                no achievement list hotkey
+//   dreamster_list_hotkey=0                no achievement list hotkey (only
+//                                          matters with the in-game menu off,
+//                                          MINICAST_MENU=0; the menu has its
+//                                          own Achievements entry)
 // Environment (wins over the cfg): MINICAST_RA=0 (off), MINICAST_RA_DRYRUN,
 // MINICAST_RA_DEBUG, MINICAST_RA_FRAME, MINICAST_RA_CHIME_VOLUME,
 // MINICAST_RA_CHIME_TEST, MINICAST_RA_POPUPS, MINICAST_RA_LIST, and for
@@ -262,6 +265,8 @@ static std::atomic<int> g_quit{0};
 static std::atomic<int> g_quit_timeout_ms{3000};
 static std::atomic<int> g_reset_pending{0};
 static std::atomic<int> g_game_ready{0};             // load done, until shutdown
+static std::atomic<int> g_state{RA_STATE_STARTING};  // ra_state() while the thread runs
+static std::atomic<int> g_test_state{RA_STATE_OFF};  // ra_state() for host tests
 static std::atomic<int> g_list_req{0};               // overlay wants a list snapshot
 static std::atomic<ra_list_data*> g_list_result{nullptr};
 
@@ -748,7 +753,9 @@ static void RC_CCONV load_game_callback(int result, const char* error_message, r
 		if (result == RC_NO_GAME_LOADED) {
 			ra_log("game not recognized by RetroAchievements (hash %s), RA idle for this session", g_hash);
 			notify(RA_NOTIF_INFO, 0, 0, "", "RetroAchievements", "Game not recognized - no achievements");
+			g_state.store(RA_STATE_NOT_RECOGNIZED, std::memory_order_release);
 		} else {
+			g_state.store(RA_STATE_FAILED, std::memory_order_release);
 			ra_log("game load failed: %s (%d)", error_message ? error_message : "?", result);
 			notify(RA_NOTIF_ERROR, 0, 0, "", "RetroAchievements: game load failed",
 				error_message ? error_message : "unknown error");
@@ -776,6 +783,7 @@ static void RC_CCONV load_game_callback(int result, const char* error_message, r
 
 	g_game_loaded = 1;
 	g_game_ready.store(1, std::memory_order_release);
+	g_state.store(RA_STATE_READY, std::memory_order_release);
 	if (g_cfg.chime_test) {
 		ra_log("chime test (dreamster_chime_test / MINICAST_RA_CHIME_TEST)");
 		play_chime();
@@ -791,6 +799,7 @@ static void RC_CCONV login_callback(int result, const char* error_message, rc_cl
 		ra_log("LOGIN FAILED for '%s': %s (%d)", g_cfg.user, error_message ? error_message : "?", result);
 		notify(RA_NOTIF_ERROR, 0, 0, "", "RetroAchievements login failed",
 			error_message ? error_message : "check retroachievements.cfg");
+		g_state.store(RA_STATE_LOGIN_FAILED, std::memory_order_release);
 		g_ra_dead = 1;
 		return;
 	}
@@ -977,6 +986,7 @@ static void* ra_thread_main(void*)
 		hashed = compute_hash(g_game_path, g_hash);
 	if (!hashed) {
 		ra_log("could not compute the RetroAchievements hash of %s, RA off for this session", g_game_path);
+		g_state.store(RA_STATE_FAILED, std::memory_order_release);
 		g_ra_dead = 1;
 	} else {
 		ra_log("hash %s for %s (%llu ms)", g_hash, g_game_path, (unsigned long long)(mono_ms() - t0));
@@ -987,6 +997,7 @@ static void* ra_thread_main(void*)
 		g_client = rc_client_create(ra_read_memory, ra_server_call);
 		if (!g_client) {
 			ra_log("rc_client_create failed");
+			g_state.store(RA_STATE_FAILED, std::memory_order_release);
 			g_ra_dead = 1;
 		}
 	}
@@ -1114,6 +1125,15 @@ int ra_game_ready(void)
 	return g_game_ready.load(std::memory_order_acquire);
 }
 
+int ra_state(void)
+{
+	if (!g_thread_running.load(std::memory_order_acquire))
+		return g_test_state.load(std::memory_order_acquire);
+	if (g_quit.load(std::memory_order_acquire))
+		return RA_STATE_OFF;
+	return g_state.load(std::memory_order_acquire);
+}
+
 int ra_cfg_popups(void) { return g_cfg.popups; }
 int ra_cfg_popup_position(void) { return g_cfg.popup_position; }
 int ra_cfg_list_hotkey(void) { return g_cfg.list_hotkey; }
@@ -1182,6 +1202,11 @@ char* ra_test_dryrun_response(const char* post_data)
 void ra_test_set_game_ready(int ready)
 {
 	g_game_ready.store(ready, std::memory_order_release);
+}
+
+void ra_test_set_state(int state)
+{
+	g_test_state.store(state, std::memory_order_release);
 }
 
 void ra_test_publish_list(ra_list_data* d)
