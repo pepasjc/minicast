@@ -298,7 +298,7 @@ endif()
 
 # RetroAchievements: ra/ (minicast glue) + external/rcheevos (v12.4.0)
 include(${CMAKE_SOURCE_DIR}/../external/rcheevos.cmake)
-list(APPEND _sources ${RA_SOURCES})
+list(APPEND _sources ${RA_SOURCES} ${RA_OVERLAY_SOURCES})
 
 add_executable(${APP_NAME}.elf ${_sources})
 set_property(TARGET ${APP_NAME}.elf PROPERTY CXX_STANDARD 17)

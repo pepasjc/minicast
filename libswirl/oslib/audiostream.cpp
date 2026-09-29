@@ -307,6 +307,7 @@ void SortAudioBackends()
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include "ra_dc.h"
+#include "ra_overlay.h"   // AudioSetPaused / AudioPausedTick
 
 /*
 	RetroAchievements unlock chime: mixed into the 48 kHz output words by
@@ -377,6 +378,30 @@ struct AudioRing {
 
 static AudioRing audio_ring;
 static bool audio_threaded;                   // ring + thread active
+
+/*
+	Pause (RetroAchievements achievement list): the SH4 thread stops, so the
+	ring runs dry. Rather than letting the FIFO underrun, the feeder fades
+	the last word it sent to silence over 256 samples (~5 ms) and keeps the
+	FIFO half full of zeros; on resume the ring's samples fade back in over
+	the same length. Unthreaded mode: AudioPausedTick() on the parked SH4
+	thread feeds the zeros instead.
+*/
+static std::atomic<bool> audio_paused;
+static u32 audio_last_word;                   // feeder: last word pushed
+static int audio_gain = 256;                  // feeder: Q8 output gain (fades)
+
+static inline u32 audio_scale_word(u32 v, int gain)
+{
+	int l = ((int)(s16)(v & 0xFFFF) * gain) >> 8;
+	int r = ((int)(s16)(v >> 16) * gain) >> 8;
+	return ((u32)(u16)r << 16) | (u16)l;
+}
+
+void AudioSetPaused(bool paused)
+{
+	audio_paused.store(paused, std::memory_order_release);
+}
 static std::atomic<bool> audio_thread_stop;
 static std::atomic<bool> audio_thread_alive;
 static pthread_t audio_thread_handle;
@@ -408,6 +433,21 @@ static void* audio_thread_main(void*)
 
 	while (!audio_thread_stop.load(std::memory_order_relaxed))
 	{
+		if (audio_paused.load(std::memory_order_acquire))
+		{
+			// fade out, then zeros: keep the FIFO half full (see above)
+			u32 level = POLLY2_AUDIO_FIFO_DEPTH - polly2_audio_space();
+			u32 n = level < POLLY2_AUDIO_FIFO_DEPTH / 2 ? POLLY2_AUDIO_FIFO_DEPTH / 2 - level : 0;
+			for (u32 i = 0; i < n; i++) {
+				u32 v = 0;
+				if (audio_gain > 0)
+					v = audio_scale_word(audio_last_word, --audio_gain);
+				polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, v);
+			}
+			nanosleep(&poll, NULL);
+			continue;
+		}
+
 		u32 wr = __atomic_load_n(&R.write_pub, __ATOMIC_ACQUIRE);
 		u32 avail = wr - rd;
 		if (avail)
@@ -415,7 +455,18 @@ static void* audio_thread_main(void*)
 			u32 space = polly2_audio_space();
 			u32 n = avail < space ? avail : space;
 			chime_feeder.poll();
-			if (chime_feeder.active()) {
+			if (audio_gain < 256) {
+				// fading back in after a pause
+				for (u32 i = 0; i < n; i++) {
+					u32 v = R.data[(rd + i) & R.mask];
+					if (chime_feeder.active())
+						v = chime_feeder.mix(v);
+					audio_last_word = v;
+					if (audio_gain < 256)
+						v = audio_scale_word(v, audio_gain++);
+					polly2_mmio_wr(POLLY2_MMIO_AUDIO_DATA, v);
+				}
+			} else if (chime_feeder.active()) {
 				for (u32 i = 0; i < n; i++) {
 					u32 v = R.data[(rd + i) & R.mask];
 					if (chime_feeder.active())
@@ -429,6 +480,8 @@ static void* audio_thread_main(void*)
 
 			if (n)
 			{
+				if (audio_gain >= 256)
+					audio_last_word = R.data[(rd + n - 1) & R.mask];
 				rd += n;
 				__atomic_store_n(&R.read_pub, rd, __ATOMIC_SEQ_CST);
 				if (__atomic_load_n(&R.prod_waiting, __ATOMIC_SEQ_CST))
@@ -488,6 +541,16 @@ static inline void audio_ring_put(u32 v, bool wait)
 	R.write_priv = wr;
 	if ((wr & (AUDIO_RING_PUBLISH - 1)) == 0)
 		__atomic_store_n(&R.write_pub, wr, __ATOMIC_RELEASE);
+}
+
+// Unthreaded mode while paused (SH4 thread, parked): zeros keep the FIFO
+// from underrunning. The threaded feeder does this by itself.
+void AudioPausedTick()
+{
+	if (audio_threaded || !polly2_mmio)
+		return;
+	while (polly2_audio_level() < POLLY2_AUDIO_FIFO_DEPTH / 2)
+		polly2_audio_push(0, 0);
 }
 
 // Free output space for pacing (freerunning UpdateSystem): FIFO space minus

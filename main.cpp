@@ -59,6 +59,7 @@ void do_vram_dump(u8* vram, u8* pvr_regs) {
 #include <pthread.h>
 #include "stdclass.h"
 #include "ra_dc.h"
+#include "ra_overlay.h"
 
 // Upper bound for letting RetroAchievements submissions still in flight
 // finish on exit. The launcher's Start+L quit sends SIGTERM, waits 1.5 s,
@@ -399,6 +400,13 @@ int kbhit(void) {
 // queues an spg_screenshot the same way (taken at the next SPG vblank).
 // ButtonExit / ButtonScreenshot in an [inputN] section additionally map a
 // per-device button (or key) to the same two actions.
+//
+// RetroAchievements achievement list (ra_overlay): Start + Select held 0.5 s
+// on a mapped pad, or F6 on any keyboard. Select is the pad's BTN_SELECT
+// (or the [inputN] ButtonSelect = key:<code> mapping); the Dreamcast has no
+// Select, so while it is held the pad's Start is kept from the game. While
+// the list is open the arrow keys / Enter / Backspace / PgUp / PgDn of any
+// keyboard work too.
 
 #include <linux/input.h>
 #include <sys/ioctl.h>
@@ -609,6 +617,10 @@ struct EvdevPad {
 	int hidFd;                 // hidraw node of the same device (GET_REPORT), -1 = none
 	uint64_t lastEventNs;      // last key/abs event read from evdev
 	uint64_t lastCheckedSample;// shadow sample seq already compared
+	int selectCode;            // key code of the pad's Select (RA list hotkey)
+	bool selHeld;              // Select currently held
+	uint64_t comboSince;       // Start+Select held since (mono ns), 0 = not
+	bool comboFired;           // hotkey sent for this hold
 };
 
 static bool g_evdev_mode = false;   // any [inputN] section in emu.cfg
@@ -643,7 +655,7 @@ static bool evdev_path_less(const std::string& a, const std::string& b) {
 }
 
 // device id -> mappings, from [input0]..[inputN]; kept for hotplug rescans
-struct CfgPad { InMapping map[TGT_COUNT]; bool any; int port; };
+struct CfgPad { InMapping map[TGT_COUNT]; bool any; int port; int selectCode; };
 static std::map<std::string, CfgPad> g_cfgpads;
 
 // hotplug: /dev/input mtime the last scan saw, debounced by one poll period
@@ -722,6 +734,15 @@ static void evdev_load_cfg() {
 			std::string val = cfgLoadStr(section, TARGET_CFG_KEYS[t], "");
 			if (!val.empty() && decode_mapping(val.c_str(), &pad.map[t]))
 				pad.any = true;
+		}
+		// Select for the RA list hotkey: optional ButtonSelect = key:<code>,
+		// else the standard gamepad BTN_SELECT
+		pad.selectCode = BTN_SELECT;
+		{
+			InMapping sm;
+			std::string val = cfgLoadStr(section, "ButtonSelect", "");
+			if (!val.empty() && decode_mapping(val.c_str(), &sm) && sm.kind == InMapping::KEY)
+				pad.selectCode = sm.code;
 		}
 		g_cfgpads[devid] = pad;
 	}
@@ -824,6 +845,10 @@ static void evdev_add_pad(const std::string& path, int fd, const std::string& ba
 		pad.hidFd = -1;
 		pad.lastEventNs = 0;
 		pad.lastCheckedSample = 0;
+		pad.selectCode = it != g_cfgpads.end() ? it->second.selectCode : BTN_SELECT;
+		pad.selHeld = false;
+		pad.comboSince = 0;
+		pad.comboFired = false;
 		if (it != g_cfgpads.end()) {
 			// known device: if its port carries a maple keyboard/mouse
 			// (Peripherals page), its events feed that device's state
@@ -848,6 +873,10 @@ static void evdev_add_pad(const std::string& path, int fd, const std::string& ba
 				}
 				if (t == TGT_ANALOG_X || t == TGT_ANALOG_Y)
 					pad.relDriven[t - TGT_ANALOG_X] = m.kind == InMapping::REL;
+				// Select already drives something: no list hotkey on this pad
+				if ((m.kind == InMapping::KEY && m.code == pad.selectCode) ||
+					(m.kind == InMapping::KEYPAIR && (m.neg == pad.selectCode || m.pos == pad.selectCode)))
+					pad.selectCode = -1;
 			}
 		}
 		if (mapped)
@@ -992,6 +1021,8 @@ static void evdev_feed(EvdevPad& p, u16 type, u16 code, s32 value) {
 
 	switch (type) {
 	case EV_KEY:
+		if ((int)code == p.selectCode)
+			p.selHeld = value != 0;
 		for (int t = 0; t < TGT_COUNT; t++) {
 			const InMapping& m = p.map[t];
 			if (m.kind == InMapping::KEY && m.code == (int)code) {
@@ -1240,6 +1271,8 @@ static void evdev_resync(EvdevPad& p) {
 				if (c >= 0 && c <= KEY_MAX)
 					evdev_feed(p, EV_KEY, c, (keys[c / 8] >> (c % 8)) & 1);
 		}
+		if (p.selectCode >= 0 && p.selectCode <= KEY_MAX)
+			p.selHeld = (keys[p.selectCode / 8] >> (p.selectCode % 8)) & 1;
 	}
 	for (int t = 0; t < TGT_COUNT; t++) {
 		const InMapping& m = p.map[t];
@@ -1249,6 +1282,30 @@ static void evdev_resync(EvdevPad& p) {
 				evdev_feed(p, EV_ABS, m.code, ai.value);
 		}
 	}
+}
+
+// keyboard keys that drive the RA achievement list while it is open
+// (RA_MENU_* bits held), from every evdev device
+static uint32_t g_kbd_menu = 0;
+
+static void kbd_menu_key(u16 code, s32 value) {
+	uint32_t bit = 0;
+	switch (code) {
+	case KEY_UP:        bit = RA_MENU_UP; break;
+	case KEY_DOWN:      bit = RA_MENU_DOWN; break;
+	case KEY_LEFT:      bit = RA_MENU_LEFT; break;
+	case KEY_RIGHT:     bit = RA_MENU_RIGHT; break;
+	case KEY_ENTER:
+	case KEY_KPENTER:   bit = RA_MENU_A; break;
+	case KEY_BACKSPACE: bit = RA_MENU_B; break;
+	case KEY_PAGEUP:    bit = RA_MENU_L; break;
+	case KEY_PAGEDOWN:  bit = RA_MENU_R; break;
+	default: return;
+	}
+	if (value == 1)
+		g_kbd_menu |= bit;
+	else if (value == 0)
+		g_kbd_menu &= ~bit;
 }
 
 static void evdev_read_pad(EvdevPad& p) {
@@ -1292,6 +1349,14 @@ static void evdev_read_pad(EvdevPad& p) {
 				// Print Screen: queue a screenshot; taken at the next SPG
 				// vblank (rend_vblank -> ScreenshotVBlank -> spg_screenshot)
 				QueueScreenshot();
+			}
+			if (ev[e].type == EV_KEY) {
+				// F6: RetroAchievements achievement list (open / close)
+				if (ev[e].code == KEY_F6 && ev[e].value == 1 && ra_overlay_list_enabled()) {
+					printf("evdev: F6 on %s (achievement list)\n", p.path.c_str());
+					ra_overlay_hotkey();
+				}
+				kbd_menu_key(ev[e].code, ev[e].value);
 			}
 			if (ev[e].type == EV_KEY || ev[e].type == EV_ABS)
 				p.lastEventNs = mono_ns();
@@ -1347,6 +1412,8 @@ static void evdev_hid_repair(EvdevPad& p) {
 	}
 }
 
+static bool g_input_suppress = false;   // see the end of evdev_update
+
 // Reads every pad once and refreshes ALL FOUR maple ports (each device
 // lands on its configured port; devices sharing one merge). Called from
 // UpdateInputState(0) only - maple polls ports in bus order, so ports 1..3
@@ -1376,15 +1443,48 @@ static void evdev_update() {
 		p.actPrev[0] = p.held[TGT_BTN_EXIT];
 		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
+		// RetroAchievements list hotkey: Start + Select held 0.5 s (once per
+		// hold); Select keeps Start from the game while the list is usable
+		bool ra_sel = p.selHeld && ra_overlay_list_enabled();
+		if (ra_sel && p.held[TGT_BTN_START]) {
+			uint64_t now = mono_ns();
+			if (!p.comboSince)
+				p.comboSince = now;
+			else if (!p.comboFired && now - p.comboSince >= 500000000ULL) {
+				p.comboFired = true;
+				printf("evdev: Start+Select on %s (achievement list)\n", p.path.c_str());
+				ra_overlay_hotkey();
+			}
+		} else {
+			p.comboSince = 0;
+			p.comboFired = false;
+		}
+
 		// buttons OR across same-port devices; biggest absolute axis wins
 		int q = p.port & 3;
 		for (int t = 0; t < TGT_COUNT; t++)
-			if (TARGET_BTN_BIT[t] && p.held[t])
+			if (TARGET_BTN_BIT[t] && p.held[t] && !(t == TGT_BTN_START && ra_sel))
 				buttons[q] &= ~TARGET_BTN_BIT[t];
 		if (abs(p.analog[0]) > abs(ax[q])) ax[q] = p.analog[0];
 		if (abs(p.analog[1]) > abs(ay[q])) ay[q] = p.analog[1];
 		if (p.trig[0] > l[q]) l[q] = p.trig[0];
 		if (p.trig[1] > r[q]) r[q] = p.trig[1];
+	}
+
+	// after the achievement list closed: the button that closed it (and any
+	// other held one) must not reach the game - nothing until all released
+	if (g_input_suppress) {
+		bool any = false;
+		for (int q = 0; q < 4; q++)
+			any |= buttons[q] != 0xFFFF || l[q] > 64 || r[q] > 64;
+		if (any) {
+			for (int q = 0; q < 4; q++) {
+				buttons[q] = 0xFFFF;
+				l[q] = r[q] = 0;
+			}
+		} else {
+			g_input_suppress = false;
+		}
 	}
 
 	for (int q = 0; q < 4; q++) {
@@ -1446,6 +1546,43 @@ void UpdateInputState(u32 port) {
 	// legacy js0 mode: evdev devices are still monitored for the ESC exit
 	for (size_t i = 0; i < g_evdev_pads.size(); i++)
 		evdev_read_pad(g_evdev_pads[i]);
+}
+
+// RetroAchievements list (emulation paused, SH4 thread parked in the vblank
+// hook): the same device polling as the game's, the buttons go to the list.
+uint32_t ra_frontend_menu_input(void) {
+	evdev_hotplug_poll();
+	if (g_evdev_mode)
+		evdev_update();
+	else
+		for (size_t i = 0; i < g_evdev_pads.size(); i++)
+			evdev_read_pad(g_evdev_pads[i]);
+	uint32_t m = g_kbd_menu;
+	if (!g_evdev_mode)
+		return m;
+	for (int q = 0; q < 4; q++) {
+		u16 k = (u16)~kcode[q];   // active-low
+		if (k & DC_DPAD_UP) m |= RA_MENU_UP;
+		if (k & DC_DPAD_DOWN) m |= RA_MENU_DOWN;
+		if (k & DC_DPAD_LEFT) m |= RA_MENU_LEFT;
+		if (k & DC_DPAD_RIGHT) m |= RA_MENU_RIGHT;
+		if (k & DC_BTN_A) m |= RA_MENU_A;
+		if (k & DC_BTN_B) m |= RA_MENU_B;
+		if (k & DC_BTN_X) m |= RA_MENU_X;
+		if (k & DC_BTN_Y) m |= RA_MENU_Y;
+		if (k & DC_BTN_START) m |= RA_MENU_START;
+		if (lt[q] > 128) m |= RA_MENU_L;
+		if (rt[q] > 128) m |= RA_MENU_R;
+		if (joyy[q] < -90) m |= RA_MENU_UP;
+		if (joyy[q] > 90) m |= RA_MENU_DOWN;
+		if (joyx[q] < -90) m |= RA_MENU_LEFT;
+		if (joyx[q] > 90) m |= RA_MENU_RIGHT;
+	}
+	return m;
+}
+
+void ra_frontend_input_suppress(void) {
+	g_input_suppress = true;
 }
 
 // purupuru pack rumble -> evdev force feedback, for every FF_RUMBLE-capable

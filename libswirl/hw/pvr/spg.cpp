@@ -14,6 +14,7 @@
 #include "hw/sh4/sh4_sched.h"
 #include "rend/mister_rend/mister_support.h"
 #include "ra_dc.h"
+#include "ra_overlay.h"
 
 //SPG emulation; Scanline/Raster beam registers & interrupts
 //Time to emulate that stuff correctly ;)
@@ -183,6 +184,11 @@ struct SPG_impl final : SPG {
                 // RetroAchievements: one rc_client_do_frame per vblank, run
                 // on the RA thread (cpu0); a load + compare when RA is off
                 ra_frame_hook(RA_FRAME_VBLANK);
+                // RA overlay (popups / achievement list): only while one is
+                // up - the displayed FB for the overlay thread. The SH4
+                // thread parks in here while the achievement list is open.
+                if (ra_overlay_wants_vblank())
+                    ra_overlay_vblank(FB_R_SOF1, FB_R_CTRL.full, VO_CONTROL.full, SPG_CONTROL.full);
 
                 if ((os_GetSeconds() - last_stats) > 0.5)
                 {

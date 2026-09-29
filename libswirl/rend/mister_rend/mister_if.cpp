@@ -17,6 +17,7 @@
 #include "hw/pvr/ta_ring.h"
 #include "mister_support.h"
 #include "ra_dc.h"
+#include "ra_overlay.h"
 
 u32 FrameCount;
 static uint64_t RenderTime = 0;
@@ -30,21 +31,34 @@ static inline uint64_t now_ns(void) {
 
 void SetREP(u32 render_end_pending_cycles);
 static u8* vram;
+static std::atomic<bool> polly_gone;
+
+// RA overlay (achievement list): PowerVR idle before drawing into VRAM with
+// the SH4 thread parked (a render it started may still be finishing)
+static bool ra_gpu_idle() {
+    return !polly_gone || polly2_done();
+}
+
 void rend_init_renderer(u8* vram) {
     ::vram = vram;
     // initialize renderer
     printf("rend_init_renderer\n");
-	
+
 	polly2_mmio_init();
     polly2_reset();
     polly2_set_vram_base(0x32000000);
     printf("polly2: ClockSel set to %u\n", (unsigned)settings.polly2.ClockSel);
     polly2_set_clock(settings.polly2.ClockSel);
+
+    // RetroAchievements popups / list draw into the displayed framebuffer
+    ra_overlay_init(vram, VRAM_MASK, ra_gpu_idle);
 }
 
 void rend_term_renderer() {
     // terminate renderer
     // printf("rend_term_renderer\n");
+    // before VRAM is unmapped: the overlay thread reads/writes it
+    ra_overlay_shutdown();
 }
 
 void rend_vblank() {
@@ -57,8 +71,6 @@ void rend_vblank() {
 // freerunning REP poll: report the FPGA's actual completion, with the same
 // 500ms watchdog + AutoReset the blocking wait in rend_end_render has
 static uint64_t poll_deadline_ns;
-
-static std::atomic<bool> polly_gone;
 
 extern std::atomic<bool> vram_dump_pending;
 extern void do_vram_dump(u8* vram, u8* pvr_regs);
@@ -116,6 +128,12 @@ void startpolly() {
 }
 
 void rend_start_render(u8* vram) {
+    // RA overlay: where this render writes (FB_W_SOF1, + SOF2 for field
+    // rendering), before anything can reach the PowerVR. Waits only while the
+    // overlay is working on an overlapping range (rare, ~1 ms).
+    ra_overlay_render_start(FB_W_SOF1, FB_W_SOF2, SCALER_CTL.interlace,
+                            FB_W_LINESTRIDE.stride * 8, FB_Y_CLIP.max + 1);
+
     if (settings.pvr.MultithreadedTA == TA_MTTA_DECOUPLED) {
         // ta_ring_publish();
         // auto goal = ta_contexts[CORE_CURRENT_CTX];
@@ -184,6 +202,10 @@ void rend_end_render() {
     }
 	
     FrameCount++;
+
+    // RA overlay: the target is complete; a popup can go into it before the
+    // game flips to it
+    ra_overlay_render_end();
 
     // RetroAchievements with dreamster_frame_source=render: one
     // rc_client_do_frame per rendered frame instead of per vblank
