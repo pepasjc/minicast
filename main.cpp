@@ -415,14 +415,13 @@ int kbhit(void) {
 // per-device button (or key) to the same two actions.
 //
 // In-game menu (ra_overlay / ra_menu; with MINICAST_MENU=0 the RetroAchievements
-// achievement list instead): Start + Select or Start + R
-// held 0.5 s on a mapped pad, or F6 on any keyboard. Select is the pad's
-// BTN_SELECT (or the [inputN] ButtonSelect = key:<code> mapping); the Dreamcast
-// has no Select, so while it is held the pad's Start is kept from the game.
-// Start + R is for pads without a Select (arcade sticks, where the coin button
-// is usually the Exit button): R is the mapped R trigger (digital, or analog
-// past ~80%); R and Start still reach the game (a quick Start tap pauses as
-// usual - racing games hold R), only a 0.5 s hold of both opens the menu. While
+// achievement list instead): Start + L on a mapped pad (L pressed while Start
+// is held - the launcher's old "Start + L quits" shortcut; the menu's Exit
+// Game / Exit Emulator replace it), Start + Select held 0.5 s, or F6 on any
+// keyboard. L is the mapped L trigger (digital, or analog past ~80%). Select
+// is the pad's BTN_SELECT (or the [inputN] ButtonSelect = key:<code> mapping);
+// the Dreamcast has no Select, so while it is held the pad's Start is kept
+// from the game. While
 // the menu is open the arrow keys / Enter / Backspace / PgUp / PgDn of any
 // keyboard work too.
 
@@ -639,6 +638,7 @@ struct EvdevPad {
 	bool selHeld;              // Select currently held
 	uint64_t comboSince;       // Start+Select held since (mono ns), 0 = not
 	bool comboFired;           // hotkey sent for this hold
+	bool lPrev;                // L trigger held at the previous poll (Start+L edge)
 };
 
 static bool g_evdev_mode = false;   // any [inputN] section in emu.cfg
@@ -867,6 +867,7 @@ static void evdev_add_pad(const std::string& path, int fd, const std::string& ba
 		pad.selHeld = false;
 		pad.comboSince = 0;
 		pad.comboFired = false;
+		pad.lPrev = false;
 		if (it != g_cfgpads.end()) {
 			// known device: if its port carries a maple keyboard/mouse
 			// (Peripherals page), its events feed that device's state
@@ -1462,21 +1463,25 @@ static void evdev_update() {
 		p.actPrev[0] = p.held[TGT_BTN_EXIT];
 		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
-		// in-game menu / achievement list hotkey: Start + Select or Start + R
-		// held 0.5 s (once per hold); Select keeps Start from the game while
-		// the hotkey is usable, R does not (see the header comment)
+		// in-game menu / achievement list hotkeys (see the header comment):
+		// Start + L opens it on the L press; Start + Select after a 0.5 s hold
+		// (once per hold), and Select keeps Start from the game meanwhile
 		bool ra_on = ra_overlay_hotkey_enabled();
 		bool ra_sel = p.selHeld && ra_on;
-		bool ra_r = ra_on && p.trig[1] >= 204;
-		if ((ra_sel || ra_r) && p.held[TGT_BTN_START]) {
+		const char* what = ra_overlay_menu_enabled() ? "in-game menu" : "achievement list";
+		bool l_now = p.trig[0] >= 204;
+		if (ra_on && l_now && !p.lPrev && p.held[TGT_BTN_START]) {
+			printf("evdev: Start+L on %s (%s)\n", p.path.c_str(), what);
+			ra_overlay_hotkey();
+		}
+		p.lPrev = l_now;
+		if (ra_sel && p.held[TGT_BTN_START]) {
 			uint64_t now = mono_ns();
 			if (!p.comboSince)
 				p.comboSince = now;
 			else if (!p.comboFired && now - p.comboSince >= 500000000ULL) {
 				p.comboFired = true;
-				printf("evdev: Start+%s on %s (%s)\n",
-				       ra_sel ? "Select" : "R", p.path.c_str(),
-				       ra_overlay_menu_enabled() ? "in-game menu" : "achievement list");
+				printf("evdev: Start+Select on %s (%s)\n", p.path.c_str(), what);
 				ra_overlay_hotkey();
 			}
 		} else {
