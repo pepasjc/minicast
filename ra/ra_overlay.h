@@ -15,7 +15,7 @@
 //                       loads a game / exits)
 //   STARTRENDER         ra_overlay_render_start(): where the PowerVR writes
 //   render end          ra_overlay_render_end()
-//   evdev (SH4 thread)  ra_overlay_hotkey(): Start+Select / Start+R held / F6
+//   evdev (SH4 thread)  ra_overlay_hotkey(): Start+L / Start+Select held / F6
 //
 // Rules that keep the game image intact (details in ra_osd.h/.cpp):
 //   - a buffer is only read/written while no render into an overlapping
@@ -64,7 +64,7 @@ void ra_overlay_render_start(uint32_t fb_w_sof1, uint32_t fb_w_sof2, bool two_fi
 	uint32_t line_bytes, uint32_t lines);
 void ra_overlay_render_end(void);
 
-// The hotkey fired (Start+Select / Start+R held 0.5 s on a mapped pad, or
+// The hotkey fired (Start+L, or Start+Select held 0.5 s, on a mapped pad, or
 // F6): opens the menu (or the achievement list) at the next vblank, or
 // closes it while it is open.
 void ra_overlay_hotkey(void);

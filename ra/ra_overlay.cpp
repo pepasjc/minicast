@@ -823,7 +823,7 @@ static void overlay_start(uint8_t* vram, uint32_t vram_mask, bool (*gpu_idle)(vo
 	}
 	g_exit_req.store(0);
 	g_exit_ack.store(0);
-	ra_log("overlay: popups %s (%s, %d ms), hotkey (Start+Select / Start+R held 0.5 s, F6) opens %s",
+	ra_log("overlay: popups %s (%s, %d ms), hotkey (Start+L, Start+Select held 0.5 s, F6) opens %s",
 		g_popups.load() ? "on" : "off", ra_position_name(g_position), g_popup_ms,
 		g_menu_on ? "the in-game menu" : (g_list_enabled ? "the achievement list" : "nothing"));
 }
