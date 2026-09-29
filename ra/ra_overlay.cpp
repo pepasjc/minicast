@@ -9,7 +9,13 @@
 //                 an "in flight" flag (a handful of stores per render). While
 //                 the list is open it parks in ra_overlay_vblank(): reads
 //                 input for the list at ~66 Hz, audio stays silent.
-//   ra_ovl (cpu0) everything else: popup queue, drawing, restoring, the list.
+//   ra_ovl (cpu0) everything else: popup queue, drawing, restoring, the menu
+//                 and the list (the menu's file I/O and register writes too).
+//
+// Menu exit (Load Game / Exit Emulator): the overlay thread writes
+// request.json, draws the "Exiting..." page and raises g_exit_req; the parked
+// SH4 thread picks it up in pause_loop and calls ra_frontend_exit() (the same
+// save + RetroAchievements flush as the ESC / SIGTERM exits, then _exit(0)).
 //
 // Render/overlay handshake (the only place the SH4 thread may wait): the
 // overlay announces the range it is about to read/write (g_ovl_busy, seq_cst
@@ -23,6 +29,7 @@
 #include "ra_overlay.h"
 #include "ra_osd.h"
 #include "ra_dc.h"
+#include "ra_menu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,7 +52,13 @@ static sem_t g_sem;
 static RaVram g_vm;
 static bool (*g_gpu_idle)(void) = nullptr;
 static int g_popup_ms = 4000;
-static int g_popups = 1, g_position = RA_POS_LEFT, g_list_enabled = 1;
+static int g_position = RA_POS_LEFT, g_list_enabled = 1;
+static std::atomic<int> g_popups{1};      // the menu's Options can change it
+static bool g_menu_on = false;            // hotkey opens the menu (else the list)
+static RaMenu g_menu;                     // overlay thread (after init)
+static char g_game_path[1024];
+static std::atomic<int> g_exit_req{0};    // overlay -> SH4: request.json written, exit
+static std::atomic<int> g_exit_ack{0};    // SH4 -> overlay: ra_frontend_exit() returned (tests)
 
 static uint64_t mono_us(void)
 {
@@ -202,7 +215,7 @@ struct OvlGuard : RaGuard {
 };
 
 // ---------------------------------------------------------------------------
-// pause (achievement list)
+// pause (in-game menu / achievement list)
 // ---------------------------------------------------------------------------
 
 enum { PAUSE_NONE = 0, PAUSE_REQUESTED, PAUSE_PARKED, PAUSE_DONE };
@@ -217,37 +230,56 @@ void ra_overlay_hotkey(void)
 		return;
 	int p = g_pause.load(std::memory_order_acquire);
 	if (p == PAUSE_PARKED) {
-		g_hotkey_seq.fetch_add(1, std::memory_order_release);   // closes the list
+		g_hotkey_seq.fetch_add(1, std::memory_order_release);   // closes the menu / list
 		return;
 	}
-	if (p != PAUSE_NONE || !g_list_enabled)
+	if (p != PAUSE_NONE)
 		return;
-	if (!ra_game_ready()) {
-		ra_log("list: hotkey, but no game is loaded");
-		ra_notify_local(RA_NOTIF_INFO, "RetroAchievements", "No achievement list for this game");
-		return;
+	if (g_menu_on) {
+		ra_menu_log("hotkey, pausing at the next vblank");
+	} else {
+		if (!g_list_enabled)
+			return;
+		if (!ra_game_ready()) {
+			ra_log("list: hotkey, but no game is loaded");
+			ra_notify_local(RA_NOTIF_INFO, "RetroAchievements", "No achievement list for this game");
+			return;
+		}
+		ra_log("list: hotkey, pausing at the next vblank");
 	}
-	ra_log("list: hotkey, pausing at the next vblank");
 	g_pause.store(PAUSE_REQUESTED, std::memory_order_release);
 	ra_ovl_flags.fetch_or(RA_OVL_PAUSE, std::memory_order_relaxed);
 }
 
-bool ra_overlay_list_enabled(void)
+bool ra_overlay_hotkey_enabled(void)
 {
-	return g_running.load(std::memory_order_relaxed) && g_list_enabled;
+	return g_running.load(std::memory_order_relaxed) && (g_menu_on || g_list_enabled);
+}
+
+bool ra_overlay_menu_enabled(void)
+{
+	return g_running.load(std::memory_order_relaxed) && g_menu_on;
 }
 
 static void pause_loop(void)
 {
 	uint64_t t0 = mono_ms();
-	ra_log("list: emulation paused");
+	const char* what = g_menu_on ? "menu" : "list";
+	ra_log("%s: emulation paused", what);
 	AudioSetPaused(true);
 	g_list_entered_ms.store(0, std::memory_order_relaxed);
 	g_pause.store(PAUSE_PARKED, std::memory_order_release);
 	sem_post(&g_sem);
 	while (g_pause.load(std::memory_order_acquire) != PAUSE_DONE) {
+		if (g_exit_req.exchange(0, std::memory_order_acq_rel)) {
+			// the menu wrote request.json: leave from this (the emulation)
+			// thread, like the ESC exit does
+			ra_menu_log("graceful exit (%s)", g_menu.request_action().c_str());
+			ra_frontend_exit();
+			g_exit_ack.store(1, std::memory_order_release);   // host tests only
+		}
 		// reads every device: the hotkey (ra_overlay_hotkey), ESC exit and
-		// the buttons for the list
+		// the buttons for the menu / list
 		uint32_t b = ra_frontend_menu_input();
 		g_menu_btn.store(b, std::memory_order_release);
 		sem_post(&g_sem);
@@ -256,7 +288,7 @@ static void pause_loop(void)
 		// the overlay thread never took the pause up: don't hang the game
 		if (!g_thread_alive.load(std::memory_order_acquire) ||
 			(!g_list_entered_ms.load(std::memory_order_relaxed) && mono_ms() - t0 > 5000)) {
-			ra_log("list: overlay thread not responding, resuming");
+			ra_log("%s: overlay thread not responding, resuming", what);
 			break;
 		}
 	}
@@ -264,7 +296,7 @@ static void pause_loop(void)
 	ra_ovl_flags.fetch_and(~RA_OVL_PAUSE, std::memory_order_relaxed);
 	AudioSetPaused(false);
 	ra_frontend_input_suppress();
-	ra_log("list: emulation resumed after %llu ms", (unsigned long long)(mono_ms() - t0));
+	ra_log("%s: emulation resumed after %llu ms", what, (unsigned long long)(mono_ms() - t0));
 }
 
 void ra_overlay_vblank(uint32_t sof1, uint32_t ctrl, uint32_t vo, uint32_t spg)
@@ -354,26 +386,13 @@ static void consume_renders(RaTracker& tr, uint32_t* last)
 }
 
 // ---------------------------------------------------------------------------
-// achievement list (runs on the overlay thread while the SH4 thread is parked)
+// in-game menu / achievement list (on the overlay thread while the SH4
+// thread is parked)
 // ---------------------------------------------------------------------------
 
-static void run_list(RaTracker& tr, OvlGuard& guard)
+// the achievement list snapshot from the RA thread (within ~3 s)
+static ra_list_data* fetch_list(void)
 {
-	uint64_t t0 = mono_ms();
-	g_list_entered_ms.store(t0 ? t0 : 1, std::memory_order_relaxed);
-
-	// a render the SH4 started before parking may still be running
-	usleep(60000);
-	for (int i = 0; i < 44 && g_gpu_idle && !g_gpu_idle(); i++)
-		usleep(10000);
-	guard.paused = true;
-
-	int left = tr.restore_all();   // popups out of the way (they come back after)
-	if (left)
-		ra_log("list: %d popup buffer(s) not restored", left);
-
-	RaGeom g;
-	bool have_geom = read_snap(&g);
 	ra_list_data* data = NULL;
 	if (ra_list_request()) {
 		for (int i = 0; i < 300 && !data && !g_quit.load(); i++) {
@@ -383,6 +402,36 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 	}
 	if (!data)
 		ra_log("list: no list from the RA thread");
+	return data;
+}
+
+enum { UI_MENU, UI_LIST };
+
+static void run_ui(RaTracker& tr, OvlGuard& guard)
+{
+	uint64_t t0 = mono_ms();
+	g_list_entered_ms.store(t0 ? t0 : 1, std::memory_order_relaxed);
+	const bool menu = g_menu_on;
+	const char* what = menu ? "menu" : "list";
+
+	// a render the SH4 started before parking may still be running
+	usleep(60000);
+	for (int i = 0; i < 44 && g_gpu_idle && !g_gpu_idle(); i++)
+		usleep(10000);
+	guard.paused = true;
+
+	int left = tr.restore_all();   // popups out of the way (they come back after)
+	if (left)
+		ra_log("%s: %d popup buffer(s) not restored", what, left);
+
+	RaGeom g;
+	bool have_geom = read_snap(&g);
+	int mode = menu ? UI_MENU : UI_LIST;
+	ra_list_data* data = NULL;
+	if (menu)
+		g_menu.open(ra_state());
+	else
+		data = fetch_list();
 
 	RaCanvas c = {};
 	RaPopWords pw = {};
@@ -390,20 +439,33 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 	RaRegion r = { 0, 0, have_geom ? g.src_w : 640, 240 };
 	RaListView v = {};
 	v.per_page = ra_list_per_page(r.w);
-	bool ok = have_geom && g.enable && data && ra_canvas_init(&c, r.w, r.h) && ra_touched_init(&t, g, r);
-	if (ok) {
-		ra_list_render(&c, data, v, true);
-		ok = ra_pop_build(&pw, g, r, c);
-	}
+	v.in_menu = menu;
+	bool ok = have_geom && g.enable && (menu || data) && ra_canvas_init(&c, r.w, r.h) && ra_touched_init(&t, g, r);
+	bool first = true;
+	// renders the current page and puts it on screen; the first draw reads
+	// what VRAM shows (the game), later ones trust drawn[] (paused: nothing
+	// else writes this buffer)
+	auto draw = [&]() {
+		if (mode == UI_MENU)
+			g_menu.render(&c);
+		else
+			ra_list_render(&c, data, v, true);
+		if (!ra_pop_build(&pw, g, r, c))
+			return false;
+		ra_touched_refresh(&t, g_vm, pw, first, NULL);
+		ra_vram_flush();
+		first = false;
+		return true;
+	};
+	if (ok)
+		ok = draw();
 	if (!ok) {
 		if (have_geom)
-			log_geom("list: cannot show the list", g);
+			log_geom(menu ? "menu: cannot show the menu" : "list: cannot show the list", g);
 		else
-			ra_log("list: cannot show the list (no display snapshot)");
+			ra_log("%s: cannot show it (no display snapshot)", what);
 	} else {
-		ra_touched_refresh(&t, g_vm, pw, true, NULL);
-		ra_vram_flush();
-		log_geom("list: open", g);
+		log_geom(menu ? "menu: open" : "list: open", g);
 	}
 
 	uint32_t hk = g_hotkey_seq.load(std::memory_order_acquire);
@@ -441,9 +503,43 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 		if (!pressed)
 			continue;
 
+		if (mode == UI_MENU) {
+			int act = g_menu.input(pressed, b);
+			g_popups.store(g_menu.options().popups ? 1 : 0, std::memory_order_relaxed);
+			if (act == RA_MACT_RESUME)
+				break;
+			if (act == RA_MACT_ACHIEVEMENTS) {
+				mode = UI_LIST;
+				v = RaListView();
+				v.per_page = ra_list_per_page(r.w);
+				v.in_menu = true;
+				draw();   // "Loading..." while the RA thread builds the snapshot
+				data = fetch_list();
+				if (!data)
+					mode = UI_MENU;
+				draw();
+				continue;
+			}
+			if (act == RA_MACT_EXIT) {
+				draw();   // "Exiting..."
+				ra_menu_log("%s requested, handing over to the emulation thread",
+					g_menu.request_action() == "load" ? "load" : "exit");
+				g_exit_ack.store(0, std::memory_order_relaxed);
+				g_exit_req.store(1, std::memory_order_release);
+				// on the target the process ends in there; host tests come back
+				while (!g_exit_ack.load(std::memory_order_acquire) && !g_quit.load(std::memory_order_acquire))
+					usleep(10000);
+				break;
+			}
+			if (act == RA_MACT_REDRAW)
+				draw();
+			continue;
+		}
+
+		// achievement list
 		RaListView nv = v;
 		bool close = false;
-		int count = (int)data->count;
+		int count = data ? (int)data->count : 0;
 		if (pressed & RA_MENU_UP)
 			ra_list_nav(&nv, count, RA_NAV_UP);
 		if (pressed & RA_MENU_DOWN)
@@ -461,17 +557,20 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 			if (pressed & RA_MENU_B)
 				close = true;
 		}
-		if (close)
-			break;
+		if (close) {
+			if (!menu)
+				break;
+			// back to the menu
+			ra_list_free(data);
+			data = NULL;
+			mode = UI_MENU;
+			draw();
+			continue;
+		}
 		if (nv.sel == v.sel && nv.first == v.first && nv.detail == v.detail)
 			continue;
 		v = nv;
-		ra_list_render(&c, data, v, true);
-		if (ra_pop_build(&pw, g, r, c)) {
-			// paused: nothing else writes this buffer, drawn[] is what VRAM holds
-			ra_touched_refresh(&t, g_vm, pw, false, NULL);
-			ra_vram_flush();
-		}
+		draw();
 	}
 
 	if (t.have) {
@@ -479,7 +578,7 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 		ra_touched_restore(&t, g_vm, &st);
 		ra_vram_flush();
 		if (st.kept_units)
-			ra_log("list: %u pixel(s) changed under the list were kept", st.kept_units);
+			ra_log("%s: %u pixel(s) changed under it were kept", what, st.kept_units);
 	}
 	ra_touched_free(&t);
 	ra_pop_free(&pw);
@@ -487,7 +586,7 @@ static void run_list(RaTracker& tr, OvlGuard& guard)
 	ra_list_free(data);
 	guard.paused = false;
 	tr.mark_all_dirty();
-	ra_log("list: closed after %llu ms", (unsigned long long)(mono_ms() - t0));
+	ra_log("%s: closed after %llu ms", what, (unsigned long long)(mono_ms() - t0));
 	g_pause.store(PAUSE_DONE, std::memory_order_release);
 }
 
@@ -538,7 +637,7 @@ static void* overlay_main(void*)
 			break;
 
 		if (g_pause.load(std::memory_order_acquire) == PAUSE_PARKED) {
-			run_list(tr, guard);
+			run_ui(tr, guard);
 			last_vbl = g_vbl.load();
 			last_done = g_rend_done.load();
 			last_rev = g_rev_seq.load();
@@ -550,8 +649,9 @@ static void* overlay_main(void*)
 
 		// popup lifecycle: shown for g_popup_ms from the first frame it is
 		// visible; dropped if the display never shows it within 15 s
-		if (showing && ((shown && now >= end_ms) || (!shown && now - start_ms > 15000))) {
-			if (!shown)
+		bool popups_on = g_popups.load(std::memory_order_relaxed) != 0;
+		if (showing && (!popups_on || (shown && now >= end_ms) || (!shown && now - start_ms > 15000))) {
+			if (!shown && popups_on)
 				ra_log("popup: never displayed, dropped: \"%s\"", txt.line1);
 			showing = false;
 			tr.set_content(lay, RaRegion(), NULL);
@@ -559,7 +659,7 @@ static void* overlay_main(void*)
 		if (!showing) {
 			ra_notification_t n;
 			while (ra_notification_pop(&n)) {
-				if (g_popups && popup_text(n, &txt)) {
+				if (popups_on && popup_text(n, &txt)) {
 					showing = true;
 					shown = false;
 					start_ms = now;
@@ -644,32 +744,55 @@ static void* overlay_main(void*)
 
 static void overlay_start(uint8_t* vram, uint32_t vram_mask, bool (*gpu_idle)(void));
 
+void ra_overlay_set_game(const char* path)
+{
+	snprintf(g_game_path, sizeof(g_game_path), "%s", path ? path : "");
+}
+
+static const RaMenuHw g_menu_hw = { ra_frontend_reg_read, ra_frontend_reg_write };
+
 void ra_overlay_init(uint8_t* vram, uint32_t vram_mask, bool (*gpu_idle)(void))
 {
-	if (g_running.load() || !vram || !ra_active())
+	if (g_running.load() || !vram)
 		return;
-	g_popups = ra_cfg_popups();
+	// MINICAST_MENU=0: no in-game menu (the hotkey opens the achievement
+	// list as before, if RetroAchievements runs)
+	const char* m = getenv("MINICAST_MENU");
+	g_menu_on = !(m && m[0] == '0');
+	bool ra = ra_active() != 0;
+	g_popups.store(ra && ra_cfg_popups() ? 1 : 0);
 	g_position = ra_cfg_popup_position();
-	g_list_enabled = ra_cfg_list_hotkey();
+	g_list_enabled = ra ? ra_cfg_list_hotkey() : 0;
 	const char* e = getenv("MINICAST_RA_POPUP_MS");
 	if (e && atoi(e) > 0)
 		g_popup_ms = atoi(e);
-	if (!g_popups && !g_list_enabled) {
-		ra_log("overlay: popups and list hotkey both off");
+	if (g_menu_on) {
+		// options.json may override the retroachievements.cfg popups setting
+		g_menu.init(getenv("MINICAST_MENU_DIR"), g_game_path, &g_menu_hw, g_popups.load() != 0);
+		if (ra)
+			g_popups.store(g_menu.options().popups ? 1 : 0);
+	} else if (!ra) {
+		return;   // nothing to show
+	} else if (!g_popups.load() && !g_list_enabled) {
+		ra_log("overlay: popups and list hotkey both off, no menu");
 		return;
 	}
 	overlay_start(vram, vram_mask, gpu_idle);
 }
 
 // host tests: no RA thread needed (notifications via ra_notify_local)
-void ra_overlay_test_start(uint8_t* vram, uint32_t vram_mask, int popup_ms, int position)
+void ra_overlay_test_start(uint8_t* vram, uint32_t vram_mask, int popup_ms, int position,
+	int menu, const char* menu_dir)
 {
 	if (g_running.load())
 		return;
-	g_popups = 1;
+	g_popups.store(1);
 	g_list_enabled = 1;
 	g_popup_ms = popup_ms;
 	g_position = position;
+	g_menu_on = menu != 0;
+	if (g_menu_on)
+		g_menu.init(menu_dir, g_game_path, &g_menu_hw, true);
 	overlay_start(vram, vram_mask, NULL);
 }
 
@@ -698,9 +821,11 @@ static void overlay_start(uint8_t* vram, uint32_t vram_mask, bool (*gpu_idle)(vo
 		ra_log("overlay: thread failed to start (%d)", err);
 		return;
 	}
-	ra_log("overlay: popups %s (%s, %d ms), list hotkey %s (Start+Select held 0.5 s / F6)",
-		g_popups ? "on" : "off", ra_position_name(g_position), g_popup_ms,
-		g_list_enabled ? "on" : "off");
+	g_exit_req.store(0);
+	g_exit_ack.store(0);
+	ra_log("overlay: popups %s (%s, %d ms), hotkey (Start+Select / Start+R held 0.5 s, F6) opens %s",
+		g_popups.load() ? "on" : "off", ra_position_name(g_position), g_popup_ms,
+		g_menu_on ? "the in-game menu" : (g_list_enabled ? "the achievement list" : "nothing"));
 }
 
 bool ra_overlay_running(void)

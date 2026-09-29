@@ -18,6 +18,7 @@
 #include "mister_support.h"
 #include "ra_dc.h"
 #include "ra_overlay.h"
+#include "ra_menu.h"   // RA_REG_*
 
 u32 FrameCount;
 static uint64_t RenderTime = 0;
@@ -32,6 +33,57 @@ static inline uint64_t now_ns(void) {
 void SetREP(u32 render_end_pending_cycles);
 static u8* vram;
 static std::atomic<bool> polly_gone;
+
+// In-game menu options (ra_menu): the polly2 cfg page registers the launcher
+// also programs. Only touched while the LW HPS-to-FPGA bridge is out of
+// reset (an access into a bridge in reset is a bus error); it always is
+// while minicast runs, the check is a guard against surprises.
+//   AUDIO_VOL  0xFF202030 on REVISION >= 6, 0xFF202028 on REVISION 3 (the
+//              r6-based builds); REVISION 4/5 have VRAM_CFG at 0x28: none
+//   CRT_CTRL   0xFF202034, REVISION >= 6 (builds without it ignore writes)
+static const uint32_t RSTMGR_BASE = 0xFFD05000u, RSTMGR_BRGMODRST = 0x1C;
+static volatile uint32_t* rstmgr_page;
+
+static bool lw_bridge_up() {
+    if (!rstmgr_page) {
+        int fd = open("/dev/mem", O_RDONLY | O_SYNC | O_CLOEXEC);
+        if (fd < 0)
+            return false;
+        void* m = mmap(0, 4096, PROT_READ, MAP_SHARED, fd, RSTMGR_BASE);
+        close(fd);
+        if (m == MAP_FAILED)
+            return false;
+        rstmgr_page = (volatile uint32_t*)m;
+    }
+    return !(rstmgr_page[RSTMGR_BRGMODRST / 4] & 2u);   // [1] lwhps2fpga in reset
+}
+
+static int menu_reg_offset(int reg) {
+    if (!polly2_mmio || !lw_bridge_up())
+        return -1;
+    uint32_t rev = polly2_revision();
+    if (reg == RA_REG_AUDIO_VOL)
+        return rev >= 6 ? 0x2030 : (rev == 3 ? 0x2028 : -1);
+    if (reg == RA_REG_CRT_CTRL)
+        return rev >= 6 ? 0x2034 : -1;
+    return -1;
+}
+
+bool ra_frontend_reg_read(int reg, uint32_t* value) {
+    int off = menu_reg_offset(reg);
+    if (off < 0)
+        return false;
+    *value = polly2_mmio_rd((uint32_t)off);
+    return true;
+}
+
+bool ra_frontend_reg_write(int reg, uint32_t value) {
+    int off = menu_reg_offset(reg);
+    if (off < 0)
+        return false;
+    polly2_mmio_wr((uint32_t)off, value);
+    return true;
+}
 
 // RA overlay (achievement list): PowerVR idle before drawing into VRAM with
 // the SH4 thread parked (a render it started may still be finishing)
@@ -50,7 +102,8 @@ void rend_init_renderer(u8* vram) {
     printf("polly2: ClockSel set to %u\n", (unsigned)settings.polly2.ClockSel);
     polly2_set_clock(settings.polly2.ClockSel);
 
-    // RetroAchievements popups / list draw into the displayed framebuffer
+    // RetroAchievements popups and the in-game menu draw into the displayed
+    // framebuffer
     ra_overlay_init(vram, VRAM_MASK, ra_gpu_idle);
 }
 

@@ -1,16 +1,21 @@
 #pragma once
 
-// RetroAchievements overlay for minicast: unlock popups drawn into the
-// displayed Dreamcast framebuffer, and the in-game achievement list (which
-// pauses the emulation). Drawing (ra_osd) happens on the "ra_ovl" thread on
+// Overlay for minicast: RetroAchievements unlock popups drawn into the
+// displayed Dreamcast framebuffer, and the in-game menu (ra_menu.h: Resume,
+// Load Game, Achievements, Options, Exit) which pauses the emulation. With
+// the menu off (MINICAST_MENU=0) the hotkey opens the achievement list
+// directly, as before. Drawing (ra_osd) happens on the "ra_ovl" thread on
 // cpu0; the SH4 thread only snapshots a few registers and signals.
 //
+//   main                ra_overlay_set_game(argv[1]) before the emulator starts
 //   rend_init_renderer  ra_overlay_init() once VRAM is mapped
 //   SH4 vblank          ra_overlay_vblank() when ra_overlay_wants_vblank();
-//                       the SH4 thread parks in there while the list is open
+//                       the SH4 thread parks in there while the menu is open
+//                       (and leaves through ra_frontend_exit() when the menu
+//                       loads a game / exits)
 //   STARTRENDER         ra_overlay_render_start(): where the PowerVR writes
 //   render end          ra_overlay_render_end()
-//   evdev (SH4 thread)  ra_overlay_hotkey(): Start+Select held / F6
+//   evdev (SH4 thread)  ra_overlay_hotkey(): Start+Select / Start+R held / F6
 //
 // Rules that keep the game image intact (details in ra_osd.h/.cpp):
 //   - a buffer is only read/written while no render into an overlapping
@@ -22,14 +27,19 @@
 #include <stdint.h>
 #include <atomic>
 
-// Starts the overlay thread if RetroAchievements is running. gpu_idle
-// reports whether the PowerVR is idle (may be NULL).
+// The running image (argv[1]): the menu's title and "current game" fallback.
+void ra_overlay_set_game(const char* path);
+// Starts the overlay thread if the in-game menu is enabled (MINICAST_MENU
+// unset or != 0) or RetroAchievements is running with popups / the list
+// hotkey on. gpu_idle reports whether the PowerVR is idle (may be NULL).
 void ra_overlay_init(uint8_t* vram, uint32_t vram_mask, bool (*gpu_idle)(void));
 bool ra_overlay_running(void);
 // Stops the thread (restores what it can). Tests / normal teardown.
 void ra_overlay_shutdown(void);
-// host tests: start without the RA thread / retroachievements.cfg
-void ra_overlay_test_start(uint8_t* vram, uint32_t vram_mask, int popup_ms, int position);
+// host tests: start without the RA thread / retroachievements.cfg;
+// menu != 0: the hotkey opens the menu (protocol files in menu_dir)
+void ra_overlay_test_start(uint8_t* vram, uint32_t vram_mask, int popup_ms, int position,
+	int menu, const char* menu_dir);
 
 // ---------------------------------------------------------------------------
 // SH4 thread
@@ -54,11 +64,14 @@ void ra_overlay_render_start(uint32_t fb_w_sof1, uint32_t fb_w_sof2, bool two_fi
 	uint32_t line_bytes, uint32_t lines);
 void ra_overlay_render_end(void);
 
-// The list hotkey fired (Start+Select held 0.5 s on a mapped pad, or F6):
-// opens the list at the next vblank, or closes it while it is open.
+// The hotkey fired (Start+Select / Start+R held 0.5 s on a mapped pad, or
+// F6): opens the menu (or the achievement list) at the next vblank, or
+// closes it while it is open.
 void ra_overlay_hotkey(void);
-// list hotkey enabled (retroachievements.cfg dreamster_list_hotkey)
-bool ra_overlay_list_enabled(void);
+// the hotkey does something: the menu is on, or the achievement list hotkey
+// (retroachievements.cfg dreamster_list_hotkey) with RA running
+bool ra_overlay_hotkey_enabled(void);
+bool ra_overlay_menu_enabled(void);
 
 // ---------------------------------------------------------------------------
 // provided by the frontend (main.cpp) and the audio backend (audiostream.cpp)
@@ -81,8 +94,16 @@ enum {
 // SH4 thread while paused: reads the input devices (hotkeys, ESC exit
 // included) and returns the RA_MENU_* buttons held on any pad/keyboard.
 uint32_t ra_frontend_menu_input(void);
-// after the list closes: the game sees no buttons until all are released
+// after the menu/list closes: the game sees no buttons until all are released
 void ra_frontend_input_suppress(void);
+// SH4 thread, paused: the menu wrote request.json - graceful exit (flash,
+// VMU, RetroAchievements flush) and _exit(0). Never returns on the target.
+void ra_frontend_exit(void);
+// polly2 cfg page registers for the menu options (RA_REG_* in ra_menu.h):
+// false when the register is not there (bitstream revision) or the LW
+// bridge is not up
+bool ra_frontend_reg_read(int reg, uint32_t* value);
+bool ra_frontend_reg_write(int reg, uint32_t value);
 
 // audio: while paused the FIFO feeder fades to silence and keeps the FIFO
 // topped up with zeros (no underrun, no stutter); resume fades back in.

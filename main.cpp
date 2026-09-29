@@ -89,6 +89,17 @@ static void save_before_exit()
 	ra_shutdown(RA_EXIT_FLUSH_MS);
 }
 
+// In-game menu Load Game / Exit Emulator (ra_overlay.h): request.json is
+// written already; called on the emulation thread, parked in the vblank hook
+// with the "Exiting..." page on screen - the same exit as ESC / SIGTERM.
+void ra_frontend_exit(void)
+{
+	printf("minicast: exit requested from the in-game menu, saving and exiting%c", 10);
+	fflush(stdout);
+	save_before_exit();
+	_exit(0);
+}
+
 // SIGTERM is blocked in every thread and taken here synchronously, so the
 // save runs in a normal thread context, not inside a signal handler.
 static void* sigterm_thread(void* arg)
@@ -131,6 +142,8 @@ int main(int argc, char* argv[])
 	// RetroAchievements: off (and free) unless /media/fat/retroachievements.cfg
 	// has a username and MINICAST_RA != 0; hashes the disc on its own thread
 	ra_init(game);
+	// in-game menu (ra_overlay / ra_menu): title + "current game" fallback
+	ra_overlay_set_game(game);
 
 	libswirl_init();
 	libswirl_loop(game);
@@ -401,15 +414,16 @@ int kbhit(void) {
 // ButtonExit / ButtonScreenshot in an [inputN] section additionally map a
 // per-device button (or key) to the same two actions.
 //
-// RetroAchievements achievement list (ra_overlay): Start + Select or Start + R
+// In-game menu (ra_overlay / ra_menu; with MINICAST_MENU=0 the RetroAchievements
+// achievement list instead): Start + Select or Start + R
 // held 0.5 s on a mapped pad, or F6 on any keyboard. Select is the pad's
 // BTN_SELECT (or the [inputN] ButtonSelect = key:<code> mapping); the Dreamcast
 // has no Select, so while it is held the pad's Start is kept from the game.
 // Start + R is for pads without a Select (arcade sticks, where the coin button
 // is usually the Exit button): R is the mapped R trigger (digital, or analog
 // past ~80%); R and Start still reach the game (a quick Start tap pauses as
-// usual - racing games hold R), only a 0.5 s hold of both opens the list. While
-// the list is open the arrow keys / Enter / Backspace / PgUp / PgDn of any
+// usual - racing games hold R), only a 0.5 s hold of both opens the menu. While
+// the menu is open the arrow keys / Enter / Backspace / PgUp / PgDn of any
 // keyboard work too.
 
 #include <linux/input.h>
@@ -1355,9 +1369,10 @@ static void evdev_read_pad(EvdevPad& p) {
 				QueueScreenshot();
 			}
 			if (ev[e].type == EV_KEY) {
-				// F6: RetroAchievements achievement list (open / close)
-				if (ev[e].code == KEY_F6 && ev[e].value == 1 && ra_overlay_list_enabled()) {
-					printf("evdev: F6 on %s (achievement list)\n", p.path.c_str());
+				// F6: in-game menu / achievement list (open / close)
+				if (ev[e].code == KEY_F6 && ev[e].value == 1 && ra_overlay_hotkey_enabled()) {
+					printf("evdev: F6 on %s (%s)\n", p.path.c_str(),
+					       ra_overlay_menu_enabled() ? "in-game menu" : "achievement list");
 					ra_overlay_hotkey();
 				}
 				kbd_menu_key(ev[e].code, ev[e].value);
@@ -1447,10 +1462,10 @@ static void evdev_update() {
 		p.actPrev[0] = p.held[TGT_BTN_EXIT];
 		p.actPrev[1] = p.held[TGT_BTN_SCREENSHOT];
 
-		// RetroAchievements list hotkey: Start + Select or Start + R held 0.5 s
-		// (once per hold); Select keeps Start from the game while the list is
-		// usable, R does not (see the header comment)
-		bool ra_on = ra_overlay_list_enabled();
+		// in-game menu / achievement list hotkey: Start + Select or Start + R
+		// held 0.5 s (once per hold); Select keeps Start from the game while
+		// the hotkey is usable, R does not (see the header comment)
+		bool ra_on = ra_overlay_hotkey_enabled();
 		bool ra_sel = p.selHeld && ra_on;
 		bool ra_r = ra_on && p.trig[1] >= 204;
 		if ((ra_sel || ra_r) && p.held[TGT_BTN_START]) {
@@ -1459,8 +1474,9 @@ static void evdev_update() {
 				p.comboSince = now;
 			else if (!p.comboFired && now - p.comboSince >= 500000000ULL) {
 				p.comboFired = true;
-				printf("evdev: Start+%s on %s (achievement list)\n",
-				       ra_sel ? "Select" : "R", p.path.c_str());
+				printf("evdev: Start+%s on %s (%s)\n",
+				       ra_sel ? "Select" : "R", p.path.c_str(),
+				       ra_overlay_menu_enabled() ? "in-game menu" : "achievement list");
 				ra_overlay_hotkey();
 			}
 		} else {
@@ -1479,8 +1495,8 @@ static void evdev_update() {
 		if (p.trig[1] > r[q]) r[q] = p.trig[1];
 	}
 
-	// after the achievement list closed: the button that closed it (and any
-	// other held one) must not reach the game - nothing until all released
+	// after the menu / achievement list closed: the button that closed it (and
+	// any other held one) must not reach the game - nothing until all released
 	if (g_input_suppress) {
 		bool any = false;
 		for (int q = 0; q < 4; q++)
@@ -1556,8 +1572,8 @@ void UpdateInputState(u32 port) {
 		evdev_read_pad(g_evdev_pads[i]);
 }
 
-// RetroAchievements list (emulation paused, SH4 thread parked in the vblank
-// hook): the same device polling as the game's, the buttons go to the list.
+// In-game menu / achievement list (emulation paused, SH4 thread parked in the
+// vblank hook): the same device polling as the game's, the buttons go to it.
 uint32_t ra_frontend_menu_input(void) {
 	evdev_hotplug_poll();
 	if (g_evdev_mode)

@@ -10,14 +10,19 @@
 //   - a threaded end-to-end run of the real overlay thread against a fake
 //     SH4 thread rendering double-buffered frames, popups and the
 //     achievement list (pause, navigation, restore)
+//   - the in-game menu end to end: hotkey -> menu -> achievement list and
+//     back -> Options (register writes, options_changed.json) -> Exit ->
+//     request.json + the frontend exit hook, VRAM restored
 //   - text helpers, list sort/paging
-//   - preview images (PPM) of popups and list pages
+//   - preview images (PPM) of popups, list pages and menu pages
 //
 //   ra_osd_test [preview_dir]
 
 #include "ra_osd.h"
 #include "ra_overlay.h"
 #include "ra_dc.h"
+#include "ra_menu.h"
+#include "ra_json.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,11 +40,28 @@ static int failures = 0;
 // ---------------------------------------------------------------------------
 
 static std::atomic<uint32_t> g_stub_btn{0};
-static std::atomic<int> g_stub_suppress{0}, g_stub_audio_paused{0}, g_stub_polls{0};
+static std::atomic<int> g_stub_suppress{0}, g_stub_audio_paused{0}, g_stub_polls{0}, g_stub_exit{0};
+static std::atomic<uint32_t> g_stub_reg[2];
 uint32_t ra_frontend_menu_input(void) { g_stub_polls++; return g_stub_btn.load(); }
 void ra_frontend_input_suppress(void) { g_stub_suppress++; }
 void AudioSetPaused(bool p) { g_stub_audio_paused = p; }
 void AudioPausedTick(void) {}
+// the target exits the process in here; the test just counts
+void ra_frontend_exit(void) { g_stub_exit++; }
+bool ra_frontend_reg_read(int reg, uint32_t* v)
+{
+	if (reg < 0 || reg > 1)
+		return false;
+	*v = g_stub_reg[reg].load();
+	return true;
+}
+bool ra_frontend_reg_write(int reg, uint32_t v)
+{
+	if (reg < 0 || reg > 1)
+		return false;
+	g_stub_reg[reg].store(v);
+	return true;
+}
 
 // ---------------------------------------------------------------------------
 // reference model (independent of ra_osd)
@@ -754,7 +776,7 @@ static void test_e2e()
 	mode_regs(E2E_MODE, 0, e2e_regs);
 	uint32_t sofs[2] = { 0x000000, E2E_FB };
 
-	ra_overlay_test_start(vram, VMASK, 300, RA_POS_LEFT);
+	ra_overlay_test_start(vram, VMASK, 300, RA_POS_LEFT, 0, NULL);
 	CHECK(ra_overlay_running());
 
 	uint32_t last[2] = { 0, 0 };
@@ -845,6 +867,184 @@ static void test_e2e()
 	CHECK(!ra_overlay_running());
 	free(before);
 	free(orig);
+}
+
+// ---------------------------------------------------------------------------
+// in-game menu: launcher files + threaded end to end
+// ---------------------------------------------------------------------------
+
+static const char* const MENU_GAMES[] = {
+	"18 Wheeler: American Pro Trucker (USA)", "Blue Stinger (USA)", "Bust-A-Move 4 (USA)",
+	"Capcom vs. SNK (USA)", "ChuChu Rocket! (USA)", "Crazy Taxi (USA)", "Crazy Taxi 2 (USA)",
+	"Dead or Alive 2 (USA)", "Dynamite Cop! (USA)", "Ecco the Dolphin: Defender of the Future (USA)",
+	"Grandia II (USA)", "House of the Dead 2, The (USA)", "Ikaruga (Japan)", "Jet Grind Radio (USA)",
+	"Marvel vs. Capcom 2 (USA)", "Mr. Driller (USA)", "Phantasy Star Online (USA)", "Power Stone 2 (USA)",
+	"Project Justice (USA)", "Quake III Arena (USA)", "Rayman 2: The Great Escape (USA)",
+	"Resident Evil - Code: Veronica (USA)", "Samba de Amigo (USA)", "San Francisco Rush 2049 (USA)",
+	"Seaman (USA)", "Sega Bass Fishing (USA)", "Sega Rally 2 (USA)", "Shenmue (USA)", "Shenmue II (Europe)",
+	"Skies of Arcadia (USA)", "Sonic Adventure (USA)", "Sonic Adventure 2 (USA)", "Soulcalibur (USA)",
+	"Space Channel 5 (USA)", "Street Fighter III: 3rd Strike (USA)", "Tony Hawk's Pro Skater 2 (USA)",
+	"Toy Commander (USA)", "Virtua Striker 2 (USA)", "Virtua Tennis (USA)", "Wacky Races (USA)",
+};
+static const int MENU_NGAMES = sizeof(MENU_GAMES) / sizeof(MENU_GAMES[0]);
+static const int MENU_CURRENT = 7;   // Dead or Alive 2
+
+static std::string menu_game_path(int i)
+{
+	return std::string("/media/fat/games/Dreamcast/") + MENU_GAMES[i] + "/" + MENU_GAMES[i] + ".gdi";
+}
+
+// the launcher's side: games.json + options.json in a fresh directory
+static bool menu_dir_setup(char* dir, size_t n, const char* options)
+{
+	snprintf(dir, n, "/tmp/ra_osd_menu.XXXXXX");
+	if (!mkdtemp(dir))
+		return false;
+	std::string s = "{\"games\":[";
+	for (int i = 0; i < MENU_NGAMES; i++) {
+		s += i ? ",{\"name\":" : "{\"name\":";
+		ra_json_quote(&s, MENU_GAMES[i]);
+		s += ",\"path\":";
+		ra_json_quote(&s, menu_game_path(i).c_str());
+		s += "}";
+	}
+	s += "],\"current\":";
+	ra_json_quote(&s, menu_game_path(MENU_CURRENT).c_str());
+	s += "}";
+	bool ok = ra_menu_write_atomic((std::string(dir) + "/games.json").c_str(), s);
+	ok &= ra_menu_write_atomic((std::string(dir) + "/options.json").c_str(), options);
+	return ok;
+}
+
+static void menu_dir_cleanup(const char* dir)
+{
+	const char* files[] = { "games.json", "options.json", "request.json", "options_changed.json" };
+	for (const char* f : files)
+		unlink((std::string(dir) + "/" + f).c_str());
+	rmdir(dir);
+}
+
+static std::string menu_file(const char* dir, const char* name)
+{
+	std::string s;
+	ra_menu_read_file((std::string(dir) + "/" + name).c_str(), &s, 1 << 20);
+	return s;
+}
+
+struct MenuScript {
+	std::atomic<int> phase{0};
+	bool menu_seen = false;
+	bool close_by_hotkey = false;
+};
+
+static void* menu_driver(void* arg)
+{
+	MenuScript* s = (MenuScript*)arg;
+	uint16_t bg = (uint16_t)ra_encode_rgb(1, ra_palette_rgb[RA_C_BG][0], ra_palette_rgb[RA_C_BG][1], ra_palette_rgb[RA_C_BG][2]);
+	RefDims d = ref_dims(E2E_MODE);
+	for (int i = 0; i < 300 && !s->menu_seen; i++) {
+		usleep(10000);
+		if (ref_get(vram, 0, d, 2, 2) == bg && ref_get(vram, 0, d, 637, 477) == bg)
+			s->menu_seen = true;
+	}
+	if (s->close_by_hotkey) {
+		usleep(100000);
+		ra_overlay_hotkey();      // hotkey again: resume
+		s->phase = 1;
+		return NULL;
+	}
+	press(RA_MENU_DOWN);          // Load Game
+	press(RA_MENU_DOWN);          // Achievements
+	press(RA_MENU_A);             // -> achievement list
+	usleep(150000);
+	press(RA_MENU_DOWN);
+	press(RA_MENU_B);             // back to the menu
+	press(RA_MENU_DOWN);          // Options
+	press(RA_MENU_A);
+	press(RA_MENU_RIGHT);         // volume one step louder
+	press(RA_MENU_DOWN);          // vertical filter
+	press(RA_MENU_LEFT);          // smooth -> light
+	press(RA_MENU_B);             // main page
+	press(RA_MENU_DOWN);          // Exit Emulator
+	press(RA_MENU_A);             // "Quit the game?"
+	press(RA_MENU_DOWN);          // Yes
+	press(RA_MENU_A);             // request.json + exit
+	s->phase = 1;
+	return NULL;
+}
+
+static void test_menu_e2e()
+{
+	// the "no achievement list" info popup test_e2e left queued: not here
+	ra_notification_t pending;
+	while (ra_notification_pop(&pending))
+		;
+	char dir[64];
+	CHECK(menu_dir_setup(dir, sizeof(dir), "{\"volume\":\"3\",\"vfilter\":\"smooth\",\"field\":\"correct\",\"popups\":\"on\"}"));
+	g_stub_reg[RA_REG_AUDIO_VOL] = 0x03;
+	g_stub_reg[RA_REG_CRT_CTRL] = 0x1D;   // correct, smooth, 240p, YPbPr
+	fill_random(vram, VSIZE);
+	mode_regs(E2E_MODE, 0, e2e_regs);
+	ra_overlay_set_game(menu_game_path(MENU_CURRENT).c_str());
+	ra_overlay_test_start(vram, VMASK, 300, RA_POS_LEFT, 1, dir);
+	CHECK(ra_overlay_running() && ra_overlay_menu_enabled() && ra_overlay_hotkey_enabled());
+	ra_test_set_state(RA_STATE_READY);
+	ra_test_set_game_ready(1);
+	ra_test_publish_list(sample_list(25));
+
+	e2e_render(0, 2000);
+	e2e_vblank(0);
+	uint8_t* before = (uint8_t*)malloc(VSIZE);
+	memcpy(before, vram, VSIZE);
+	int suppress0 = g_stub_suppress.load();
+	MenuScript script;
+	pthread_t drv;
+	pthread_create(&drv, NULL, menu_driver, &script);
+	ra_overlay_hotkey();
+	e2e_vblank(0);   // parks here: menu, list, options, exit
+	pthread_join(drv, NULL);
+	CHECK(script.phase == 1 && script.menu_seen);
+	CHECK(g_stub_exit.load() == 1);
+	CHECK(menu_file(dir, "request.json") == "{\"action\":\"exit\"}\n");
+	CHECK(g_stub_reg[RA_REG_AUDIO_VOL].load() == 0x02);
+	CHECK(g_stub_reg[RA_REG_CRT_CTRL].load() == 0x1B);
+	RaJson j;
+	std::string oc = menu_file(dir, "options_changed.json");
+	CHECK(ra_json_parse(oc.data(), oc.size(), &j));
+	CHECK(j.get_str("volume") && !strcmp(j.get_str("volume"), "2"));
+	CHECK(j.get_str("vfilter") && !strcmp(j.get_str("vfilter"), "light"));
+	CHECK(j.get_str("field") && !strcmp(j.get_str("field"), "correct"));
+	CHECK(j.get_str("popups") && !strcmp(j.get_str("popups"), "on"));
+	CHECK(g_stub_suppress.load() == suppress0 + 1);
+	CHECK(!g_stub_audio_paused.load());
+	long diff = first_diff(vram, before, VSIZE);
+	if (diff >= 0)
+		printf("  menu: VRAM differs after close at 0x%lx\n", diff);
+	CHECK(diff < 0);
+	printf("e2e menu: list and back, options applied, exit confirmed -> request.json, VRAM restored\n");
+
+	// RetroAchievements off: the menu still opens; the hotkey closes it
+	unlink((std::string(dir) + "/request.json").c_str());
+	ra_test_set_state(RA_STATE_OFF);
+	ra_test_set_game_ready(0);
+	MenuScript s2;
+	s2.close_by_hotkey = true;
+	pthread_create(&drv, NULL, menu_driver, &s2);
+	ra_overlay_hotkey();
+	e2e_vblank(0);
+	pthread_join(drv, NULL);
+	CHECK(s2.phase == 1 && s2.menu_seen);
+	CHECK(g_stub_exit.load() == 1);
+	CHECK(menu_file(dir, "request.json").empty());
+	CHECK(g_stub_suppress.load() == suppress0 + 2);
+	diff = first_diff(vram, before, VSIZE);
+	CHECK(diff < 0);
+	printf("e2e menu: RA off, opened and closed by the hotkey\n");
+
+	ra_overlay_shutdown();
+	CHECK(!ra_overlay_running());
+	free(before);
+	menu_dir_cleanup(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1250,69 @@ static void preview_list(const char* dir, const char* name, const Mode& m, RaLis
 	ra_list_free(d);
 }
 
+static void preview_menu(const char* dir, const char* name, const Mode& m, const RaMenu& menu)
+{
+	RaVram vm = test_vm();
+	uint32_t sof = 0x010000;
+	paint_scene(m, sof);
+	RaGeom g = mode_geom(m, sof);
+	RaRegion r = { 0, 0, g.src_w, 240 };
+	RaCanvas c;
+	ra_canvas_init(&c, r.w, r.h);
+	CHECK(menu.render(&c));
+	RaTouched tt;
+	RaPopWords pw = {};
+	ra_touched_init(&tt, g, r);
+	ra_pop_build(&pw, g, r, c);
+	ra_touched_refresh(&tt, vm, pw, true, NULL);
+	char path[512];
+	snprintf(path, sizeof(path), "%s/menu_preview_%s.ppm", dir, name);
+	CHECK(write_ppm(path, m, sof));
+	ra_touched_free(&tt);
+	ra_pop_free(&pw);
+	ra_canvas_free(&c);
+}
+
+static void previews_menu(const char* dir)
+{
+	char mdir[64];
+	if (!menu_dir_setup(mdir, sizeof(mdir), "{\"volume\":\"2\",\"vfilter\":\"smooth\",\"field\":\"correct\",\"popups\":\"on\"}")) {
+		CHECK(false);
+		return;
+	}
+	g_stub_reg[RA_REG_AUDIO_VOL] = 0x02;
+	g_stub_reg[RA_REG_CRT_CTRL] = 0x05;
+	static const RaMenuHw hw = { ra_frontend_reg_read, ra_frontend_reg_write };
+	RaMenu m;
+	m.init(mdir, menu_game_path(MENU_CURRENT).c_str(), &hw, true);
+	m.open(RA_STATE_READY);
+	preview_menu(dir, "main_480i_565", MODES[1], m);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_A, 0);                        // Load Game
+	preview_menu(dir, "games_480i_565", MODES[1], m);
+	preview_menu(dir, "games_320x240_565", MODES[5], m);
+	m.input(RA_MENU_B, 0);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_A, 0);                        // Options
+	m.input(RA_MENU_DOWN, 0);                     // Vertical filter selected
+	preview_menu(dir, "options_480i_565", MODES[1], m);
+	preview_menu(dir, "options_320x240_565", MODES[5], m);
+	m.input(RA_MENU_B, 0);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_A, 0);                        // Exit Emulator
+	preview_menu(dir, "confirm_exit_480i_565", MODES[1], m);
+	m.input(RA_MENU_B, 0);
+	m.open(RA_STATE_OFF);
+	preview_menu(dir, "main_raoff_240p_565", MODES[0], m);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_A, 0);
+	m.input(RA_MENU_DOWN, 0);
+	m.input(RA_MENU_A, 0);                        // "Load this game?"
+	preview_menu(dir, "confirm_load_480i_565", MODES[1], m);
+	menu_dir_cleanup(mdir);
+}
+
 static void previews(const char* dir)
 {
 	RaPopupText ach = {};
@@ -1078,6 +1341,7 @@ static void previews(const char* dir)
 	v.first = 0;
 	v.detail = true;
 	preview_list(dir, "list_detail_240p_565", MODES[0], v);
+	previews_menu(dir);
 }
 
 int main(int argc, char** argv)
@@ -1091,6 +1355,7 @@ int main(int argc, char** argv)
 	test_fresh_pixels();
 	test_tracker();
 	test_e2e();
+	test_menu_e2e();
 	if (argc > 1)
 		previews(argv[1]);
 	free(vram);
