@@ -41,7 +41,10 @@ u32 Frame_Cycles = 0;
 // real scan-out - tearing. Once per field, at the emulated vblank-in line,
 // the real raster phase is read and the next field's line length nudged
 // (PI, at most +-1%) so emulated vblank-in sits just after the real vblank
-// start; flips then happen while the CRT is blanked.
+// start; flips then happen while the CRT is blanked. A bigger error (the
+// emulator fell behind for a moment: loading, dynarec compiles) is closed in
+// one step instead - the next field is lengthened by the remaining gap (at
+// worst one repeated frame), so the lock is back within a field, not ~1 s.
 static u32 base_Line_Cycles = 0;
 static float lock_i = 0;                 // integral term (fraction of a field)
 static u32 lock_fields = 0;
@@ -51,6 +54,8 @@ static float lock_err_sum = 0, lock_err_max = 0;
 #define RASTER_LOCK_KI     0.02f
 #define RASTER_LOCK_IMAX   0.005f
 #define RASTER_LOCK_ADJMAX 0.01f
+#define RASTER_LOCK_REPHASE 0.04f       // beyond this: one-step re-phase
+static u32 lock_rephases = 0;
 
 static void raster_lock()
 {
@@ -63,6 +68,16 @@ static void raster_lock()
     }
     float e = p - RASTER_LOCK_TARGET;
     e -= floorf(e + 0.5f);               // -> [-0.5, 0.5): late > 0, early < 0
+
+    if (fabsf(e) > RASTER_LOCK_REPHASE) {
+        // late by e: the next real vblank-in target is (1 - e) fields away;
+        // early by -e: it is -e fields after a normal field. Lengthen only.
+        float stretch = e > 0 ? 1.0f - e : -e;
+        Line_Cycles = (u32)(base_Line_Cycles * (1.0f + stretch) + 0.5f);
+        lock_rephases++;
+        lock_fields++;
+        return;
+    }
     lock_i += RASTER_LOCK_KI * e;
     lock_i = std::max(-RASTER_LOCK_IMAX, std::min(RASTER_LOCK_IMAX, lock_i));
     float adj = -(RASTER_LOCK_KP * e + lock_i);
@@ -72,9 +87,10 @@ static void raster_lock()
     lock_err_sum += fabsf(e);
     lock_err_max = std::max(lock_err_max, fabsf(e));
     if (++lock_fields % 300 == 0) {
-        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f\n",
-               lock_err_sum / 300, lock_err_max, adj * 100, lock_i);
+        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f, re-phases %u\n",
+               lock_err_sum / 300, lock_err_max, adj * 100, lock_i, lock_rephases);
         lock_err_sum = lock_err_max = 0;
+        lock_rephases = 0;
     }
 }
 static int render_end_schid;
