@@ -40,7 +40,7 @@ u32 Frame_Cycles = 0;
 // game's vblank flips (FB_R_SOF1) landed at a random, drifting line of the
 // real scan-out - tearing. Once per field, at the emulated vblank-in line,
 // the real raster phase is read and the next field's line length nudged
-// (PI, at most +-1%) so emulated vblank-in sits just after the real vblank
+// (PI, at most +-1%) so emulated vblank-in sits ~6 lines into the real vblank
 // start; flips then happen while the CRT is blanked. A bigger error (the
 // emulator fell behind for a moment: loading, dynarec compiles) is closed in
 // one step instead - the next field is lengthened by the remaining gap (at
@@ -49,12 +49,12 @@ static u32 base_Line_Cycles = 0;
 static float lock_i = 0;                 // integral term (fraction of a field)
 static u32 lock_fields = 0;
 static float lock_err_sum = 0, lock_err_max = 0;
-#define RASTER_LOCK_TARGET 0.008f        // ~2 lines into the real vblank
+#define RASTER_LOCK_TARGET 0.025f        // ~6 lines into the real vblank (~22 long)
 #define RASTER_LOCK_KP     0.25f
 #define RASTER_LOCK_KI     0.02f
 #define RASTER_LOCK_IMAX   0.005f
 #define RASTER_LOCK_ADJMAX 0.01f
-#define RASTER_LOCK_REPHASE 0.10f       // beyond this: one-step re-phase
+#define RASTER_LOCK_REPHASE 0.20f       // beyond this: one-step re-phase
 static u32 lock_rephases = 0, lock_behind = 0;
 static float lock_last_pos = -1;         // real raster position, fields (mod 256)
 static bool lock_stretched = false;      // the field just ending was re-phased
