@@ -534,6 +534,7 @@ struct settings_t
 		u32 ClockSel;
 		bool AutoReset;
 		bool DumpOnLockup;
+		bool RasterLock;   // emulated vblank locked to the output raster
 	} polly2;
 
 	struct {

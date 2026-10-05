@@ -5,6 +5,10 @@
 	SPG top border band (polly2 FB_TOP, 640x30 shown as 1280x60).
 */
 #pragma once
+
+/* Output raster phase in [0, 1) since the real vblank started (polly2 RASTER,
+ * REVISION >= 7), -1 if unavailable - mister_if.cpp, used by spg.cpp. */
+float rend_raster_phase();
 #include "types.h"
 
 /* speed_pct: emulated speed in % (100 = full speed); vblank/renders are

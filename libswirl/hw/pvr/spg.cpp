@@ -4,6 +4,7 @@
 #include "license/bsd"
 
 
+#include <math.h>
 #include "hw/sh4/sh4_mmio.h"
 
 #include "spg.h"
@@ -33,6 +34,49 @@ float last_stats = 0;
 #define PIXEL_CLOCK (54*1000*1000/2)
 u32 Line_Cycles = 0;
 u32 Frame_Cycles = 0;
+
+// Vblank lock (polly2.RasterLock): the emulated SPG runs on emulated time,
+// which follows the wall clock but not the FPGA's output raster, so the
+// game's vblank flips (FB_R_SOF1) landed at a random, drifting line of the
+// real scan-out - tearing. Once per field, at the emulated vblank-in line,
+// the real raster phase is read and the next field's line length nudged
+// (PI, at most +-1%) so emulated vblank-in sits just after the real vblank
+// start; flips then happen while the CRT is blanked.
+static u32 base_Line_Cycles = 0;
+static float lock_i = 0;                 // integral term (fraction of a field)
+static u32 lock_fields = 0;
+static float lock_err_sum = 0, lock_err_max = 0;
+#define RASTER_LOCK_TARGET 0.008f        // ~2 lines into the real vblank
+#define RASTER_LOCK_KP     0.25f
+#define RASTER_LOCK_KI     0.02f
+#define RASTER_LOCK_IMAX   0.005f
+#define RASTER_LOCK_ADJMAX 0.01f
+
+static void raster_lock()
+{
+    if (!settings.polly2.RasterLock || !base_Line_Cycles)
+        return;
+    float p = rend_raster_phase();
+    if (p < 0) {
+        Line_Cycles = base_Line_Cycles;
+        return;
+    }
+    float e = p - RASTER_LOCK_TARGET;
+    e -= floorf(e + 0.5f);               // -> [-0.5, 0.5): late > 0, early < 0
+    lock_i += RASTER_LOCK_KI * e;
+    lock_i = std::max(-RASTER_LOCK_IMAX, std::min(RASTER_LOCK_IMAX, lock_i));
+    float adj = -(RASTER_LOCK_KP * e + lock_i);
+    adj = std::max(-RASTER_LOCK_ADJMAX, std::min(RASTER_LOCK_ADJMAX, adj));
+    Line_Cycles = (u32)(base_Line_Cycles * (1.0f + adj) + 0.5f);
+
+    lock_err_sum += fabsf(e);
+    lock_err_max = std::max(lock_err_max, fabsf(e));
+    if (++lock_fields % 300 == 0) {
+        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f\n",
+               lock_err_sum / 300, lock_err_max, adj * 100, lock_i);
+        lock_err_sum = lock_err_max = 0;
+    }
+}
 static int render_end_schid;
 static int vblank_schid;
 static int time_sync;
@@ -117,6 +161,7 @@ struct SPG_impl final : SPG {
         //Frame_Cycles=(u64)DCclock*(u64)sync_cycles/(u64)pixel_clock;
 
         Frame_Cycles = pvr_numscanlines * Line_Cycles;
+        base_Line_Cycles = Line_Cycles;   // raster_lock() scales from here
         prv_cur_scanline = 0;
 
         sh4_sched_request(vblank_schid, Line_Cycles);
@@ -145,6 +190,7 @@ struct SPG_impl final : SPG {
 
             if (SPG_VBLANK_INT.vblank_in_interrupt_line_number == prv_cur_scanline) {
                 asic->RaiseInterrupt(holly_SCANINT1);
+                raster_lock();
                 // static u32 lastt;
                 // printf("holly_SCANINT1: %.3f\n", (sh4_sched_now() - lastt) / 200.0 / 1000.0 / 1000.0 * 1000);
                 // lastt = sh4_sched_now();

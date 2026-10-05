@@ -85,6 +85,25 @@ bool ra_frontend_reg_write(int reg, uint32_t value) {
     return true;
 }
 
+// Output raster phase for the vblank lock (spg.cpp): RASTER / RASTER_PERIOD
+// (0xFF202038 / 0x3C, REVISION >= 7) are clk_sys cycles since the raster last
+// entered vertical blanking and the length of the last field. Returns since /
+// period in [0, 1), or -1 on bitstreams without them.
+float rend_raster_phase() {
+    static int rev = -1;
+    if (!polly2_mmio || !lw_bridge_up())
+        return -1;
+    if (rev < 0)
+        rev = (int)polly2_revision();
+    if (rev < 7)
+        return -1;
+    uint32_t per = polly2_mmio_rd(0x203C) & 0xFFFFFF;
+    uint32_t since = polly2_mmio_rd(0x2038) & 0xFFFFFF;
+    if (per < 100000 || since >= per + per / 8)   // no raster yet / stalled
+        return -1;
+    return since >= per ? 0.999f : (float)since / (float)per;
+}
+
 // RA overlay (achievement list): PowerVR idle before drawing into VRAM with
 // the SH4 thread parked (a render it started may still be finishing)
 static bool ra_gpu_idle() {
