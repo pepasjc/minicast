@@ -59,6 +59,8 @@ static u32 lock_rephases = 0, lock_behind = 0;
 static float lock_last_pos = -1;         // real raster position, fields (mod 256)
 static bool lock_stretched = false;      // the field just ending was re-phased
 static u32 lock_locked = 0;
+static u32 lock_last_rephase = 0;        // lock_fields at the last re-phase
+#define RASTER_LOCK_REPHASE_GAP 60       // at most one re-phase per second
 static float lock_last_adj = 0;
 
 static void raster_lock()
@@ -102,7 +104,19 @@ static void raster_lock()
     float e = p - RASTER_LOCK_TARGET;
     e -= floorf(e + 0.5f);               // -> [-0.5, 0.5): late > 0, early < 0
 
+    if (fabsf(e) > RASTER_LOCK_REPHASE &&
+        lock_fields - lock_last_rephase < RASTER_LOCK_REPHASE_GAP) {
+        // slipping again right after a re-phase: the game is GPU / CPU
+        // bound (fields keep running late) - stretching fields would only
+        // slow it further; free-run until it settles
+        Line_Cycles = base_Line_Cycles;
+        lock_i = 0;
+        lock_stretched = false;
+        lock_behind++;
+        return;
+    }
     if (fabsf(e) > RASTER_LOCK_REPHASE) {
+        lock_last_rephase = lock_fields;
         // late by e: the next real vblank-in target is (1 - e) fields away;
         // early by -e: it is -e fields after a normal field. Lengthen only.
         float stretch = e > 0 ? 1.0f - e : -e;
