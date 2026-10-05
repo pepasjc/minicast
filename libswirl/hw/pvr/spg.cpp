@@ -54,31 +54,49 @@ static float lock_err_sum = 0, lock_err_max = 0;
 #define RASTER_LOCK_KI     0.02f
 #define RASTER_LOCK_IMAX   0.005f
 #define RASTER_LOCK_ADJMAX 0.01f
-#define RASTER_LOCK_REPHASE 0.04f       // beyond this: one-step re-phase
+#define RASTER_LOCK_REPHASE 0.10f       // beyond this: one-step re-phase
 static u32 lock_rephases = 0, lock_behind = 0;
-static u32 lock_last_count = 0x100;      // 0x100 = none yet
+static float lock_last_pos = -1;         // real raster position, fields (mod 256)
+static bool lock_stretched = false;      // the field just ending was re-phased
+static u32 lock_locked = 0;
+static float lock_last_adj = 0;
 
 static void raster_lock()
 {
     if (!settings.polly2.RasterLock || !base_Line_Cycles)
         return;
+    // stats every 300 fields: error over the locked (PI) fields only
+    if (++lock_fields % 300 == 0) {
+        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f, "
+               "locked %u, re-phases %u, behind %u (of 300)\n",
+               lock_locked ? lock_err_sum / lock_locked : 0.0f, lock_err_max,
+               lock_last_adj * 100, lock_i, lock_locked, lock_rephases, lock_behind);
+        lock_err_sum = lock_err_max = 0;
+        lock_rephases = lock_behind = lock_locked = 0;
+    }
     u32 count = 0;
     float p = rend_raster_phase(&count);
     if (p < 0) {
         Line_Cycles = base_Line_Cycles;
         return;
     }
-    // more than one real field since the last emulated vblank-in: the
+    // well over one real field since the last emulated vblank-in: the
     // emulator is running behind (heavy scene, loading) - there is nothing to
     // lock to until it keeps up, and stretching fields would only slow it
-    // further. Free-run (and forget the integral) meanwhile.
-    u32 last = lock_last_count;
-    lock_last_count = count;
-    if (last != 0x100 && ((count - last) & 0xFF) > 1) {
+    // further. Free-run (and forget the integral) meanwhile. Measured as
+    // count + phase: the lock target sits right where the count ticks, so the
+    // count alone jitters 0 / 2 between normal fields.
+    float pos = (float)count + p, last = lock_last_pos;
+    lock_last_pos = pos;
+    float dt = pos - last;
+    if (dt < 0)
+        dt += 256.0f;
+    // a re-phased (stretched) field legitimately lasts up to 2 fields
+    if (last >= 0 && dt > (lock_stretched ? 2.5f : 1.5f)) {
+        lock_stretched = false;
         Line_Cycles = base_Line_Cycles;
         lock_i = 0;
         lock_behind++;
-        lock_fields++;
         return;
     }
     float e = p - RASTER_LOCK_TARGET;
@@ -89,10 +107,11 @@ static void raster_lock()
         // early by -e: it is -e fields after a normal field. Lengthen only.
         float stretch = e > 0 ? 1.0f - e : -e;
         Line_Cycles = (u32)(base_Line_Cycles * (1.0f + stretch) + 0.5f);
+        lock_stretched = true;
         lock_rephases++;
-        lock_fields++;
         return;
     }
+    lock_stretched = false;
     lock_i += RASTER_LOCK_KI * e;
     lock_i = std::max(-RASTER_LOCK_IMAX, std::min(RASTER_LOCK_IMAX, lock_i));
     float adj = -(RASTER_LOCK_KP * e + lock_i);
@@ -101,12 +120,8 @@ static void raster_lock()
 
     lock_err_sum += fabsf(e);
     lock_err_max = std::max(lock_err_max, fabsf(e));
-    if (++lock_fields % 300 == 0) {
-        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f, re-phases %u, behind %u\n",
-               lock_err_sum / 300, lock_err_max, adj * 100, lock_i, lock_rephases, lock_behind);
-        lock_err_sum = lock_err_max = 0;
-        lock_rephases = lock_behind = 0;
-    }
+    lock_locked++;
+    lock_last_adj = adj;
 }
 static int render_end_schid;
 static int vblank_schid;
