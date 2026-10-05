@@ -153,7 +153,11 @@ void vmem_platform_create_mappings(const vmem_mapping *vmem_maps, unsigned numma
 
 		for (unsigned j = 0; j < num_mirrors; j++) {
 			unsigned offset = vmem_maps[i].start_address + j * vmem_maps[i].memsize;
-			verify(!munmap(&virt_ram_base[offset], vmem_maps[i].memsize));
+			// no munmap first: MAP_FIXED replaces the reservation atomically.
+			// An munmap leaves a hole that another thread's mmap (the
+			// RetroAchievements threads hash the disc and allocate during
+			// start-up) can land in, and this mmap then overwrites it: heap
+			// corruption, "free(): invalid pointer"
 			verify(MAP_FAILED != mmap(&virt_ram_base[offset], vmem_maps[i].memsize, protection,
 			                          MAP_SHARED | MAP_FIXED, vmem_maps[i].fd, vmem_maps[i].memoffset));
 			// ??? (mprotect(rv,size,prot)!=0)
@@ -167,7 +171,7 @@ bool vmem_platform_prepare_jit_block(void *code_area, unsigned size, void **code
 	if (mprotect(code_area, size, PROT_READ | PROT_WRITE | PROT_EXEC)) {
 		// Well it failed, use another approach, unmap the memory area and remap it back.
 		// Seems it works well on Darwin according to reicast code :P
-		munmap(code_area, size);
+		// (MAP_FIXED alone: an munmap first races with other threads' mmaps)
 		void *ret_ptr = mmap(code_area, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANON, 0, 0);
 		// Ensure it's the area we requested
 		if (ret_ptr != code_area)
