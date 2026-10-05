@@ -88,8 +88,8 @@ bool ra_frontend_reg_write(int reg, uint32_t value) {
 // Output raster phase for the vblank lock (spg.cpp): RASTER / RASTER_PERIOD
 // (0xFF202038 / 0x3C, REVISION >= 7) are clk_sys cycles since the raster last
 // entered vertical blanking and the length of the last field. Returns since /
-// period in [0, 1), or -1 on bitstreams without them.
-float rend_raster_phase() {
+// period in [0, 1), or -1 on bitstreams without them; *count = RASTER[31:24].
+float rend_raster_phase(u32* count) {
     static int rev = -1;
     if (!polly2_mmio || !lw_bridge_up())
         return -1;
@@ -98,7 +98,8 @@ float rend_raster_phase() {
     if (rev < 7)
         return -1;
     uint32_t per = polly2_mmio_rd(0x203C) & 0xFFFFFF;
-    uint32_t since = polly2_mmio_rd(0x2038) & 0xFFFFFF;
+    uint32_t r = polly2_mmio_rd(0x2038), since = r & 0xFFFFFF;
+    *count = r >> 24;
     if (per < 100000 || since >= per + per / 8)   // no raster yet / stalled
         return -1;
     return since >= per ? 0.999f : (float)since / (float)per;

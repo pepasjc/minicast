@@ -55,15 +55,30 @@ static float lock_err_sum = 0, lock_err_max = 0;
 #define RASTER_LOCK_IMAX   0.005f
 #define RASTER_LOCK_ADJMAX 0.01f
 #define RASTER_LOCK_REPHASE 0.04f       // beyond this: one-step re-phase
-static u32 lock_rephases = 0;
+static u32 lock_rephases = 0, lock_behind = 0;
+static u32 lock_last_count = 0x100;      // 0x100 = none yet
 
 static void raster_lock()
 {
     if (!settings.polly2.RasterLock || !base_Line_Cycles)
         return;
-    float p = rend_raster_phase();
+    u32 count = 0;
+    float p = rend_raster_phase(&count);
     if (p < 0) {
         Line_Cycles = base_Line_Cycles;
+        return;
+    }
+    // more than one real field since the last emulated vblank-in: the
+    // emulator is running behind (heavy scene, loading) - there is nothing to
+    // lock to until it keeps up, and stretching fields would only slow it
+    // further. Free-run (and forget the integral) meanwhile.
+    u32 last = lock_last_count;
+    lock_last_count = count;
+    if (last != 0x100 && ((count - last) & 0xFF) > 1) {
+        Line_Cycles = base_Line_Cycles;
+        lock_i = 0;
+        lock_behind++;
+        lock_fields++;
         return;
     }
     float e = p - RASTER_LOCK_TARGET;
@@ -87,10 +102,10 @@ static void raster_lock()
     lock_err_sum += fabsf(e);
     lock_err_max = std::max(lock_err_max, fabsf(e));
     if (++lock_fields % 300 == 0) {
-        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f, re-phases %u\n",
-               lock_err_sum / 300, lock_err_max, adj * 100, lock_i, lock_rephases);
+        printf("raster lock: phase err avg %.4f max %.4f (fields), adj %+.3f%%, i %+.4f, re-phases %u, behind %u\n",
+               lock_err_sum / 300, lock_err_max, adj * 100, lock_i, lock_rephases, lock_behind);
         lock_err_sum = lock_err_max = 0;
-        lock_rephases = 0;
+        lock_rephases = lock_behind = 0;
     }
 }
 static int render_end_schid;
